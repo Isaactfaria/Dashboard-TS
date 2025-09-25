@@ -1,47 +1,41 @@
 # -*- coding: utf-8 -*-
 """
-Bling Dashboard – 2 lojas
---------------------------------
-- Client ID / Secret via Secrets (Streamlit Cloud)
-- Refresh token inicial no código (um por loja)
-- Auto-refresh em memória (session_state)
-- Botões de autorização + captura automática do ?code= com 'state'
+Bling Dashboard – 2 lojas (sem editar refresh)
+----------------------------------------------
+- Client ID / Secret via Secrets (Streamlit)
+- NÃO chama API sem refresh; pede autorização e captura ?code= automaticamente
+- Auto-refresh do access_token; refresh novo fica em memória (session_state)
+- Botões Autorizar TS / Autorizar Bazar
 """
 
 from __future__ import annotations
 import datetime as dt
 from dateutil.relativedelta import relativedelta
 from typing import List, Optional, Tuple
+from urllib.parse import urlencode
 
 import pandas as pd
 import requests
 import streamlit as st
-from urllib.parse import urlencode
 
 # =========================
 # CONFIG BÁSICA
 # =========================
-# Informe o domínio do seu app nos Secrets como APP_BASE (ex.: https://dashboard-ts.streamlit.app).
 APP_BASE = st.secrets.get("APP_BASE", "https://dashboard-ts.streamlit.app")
-REDIRECT_URI = APP_BASE  # Precisa ser exatamente o mesmo cadastrado no Bling
-
+REDIRECT_URI = APP_BASE                               # deve ser idêntico ao cadastrado no Bling
 TOKEN_URL  = "https://www.bling.com.br/Api/v3/oauth/token"
 AUTH_URL   = "https://www.bling.com.br/Api/v3/oauth/authorize"
 ORDERS_URL = "https://www.bling.com.br/Api/v3/pedidos/vendas"
 DEFAULT_LIMIT = 100
 
-# ===== Cole SOMENTE os refresh tokens iniciais =====
-REFRESH_TS    = "COLE_AQUI_O_REFRESH_TOKEN_TS"      # Loja Tiburcio's Stuff
-REFRESH_BAZAR = "COLE_AQUI_O_REFRESH_TOKEN_BAZAR"   # TS Bazar
-
 st.set_page_config(page_title="Dashboard de vendas – Bling API v3", layout="wide")
 st.title("📊 Dashboard de vendas – Bling API v3")
 
 # =========================
-# STATE – guarda refresh em memória
+# STATE – refresh em memória
 # =========================
-if "refresh_ts" not in st.session_state:    st.session_state["refresh_ts"] = REFRESH_TS
-if "refresh_bazar" not in st.session_state: st.session_state["refresh_bazar"] = REFRESH_BAZAR
+st.session_state.setdefault("refresh_ts", None)
+st.session_state.setdefault("refresh_bazar", None)
 
 # =========================
 # OAUTH HELPERS
@@ -145,6 +139,7 @@ except Exception:
 # 🔄 Captura automática do ?code= e troca usando o 'state'
 code  = st.query_params.get("code", None)
 state = st.query_params.get("state", None)
+
 if code and state == "auth-ts":
     try:
         j = exchange_code_for_tokens(st.secrets["TS_CLIENT_ID"], st.secrets["TS_CLIENT_SECRET"], code)
@@ -185,30 +180,38 @@ loja_id_val = int(loja_id_str) if loja_id_str.strip().isdigit() else None
 if st.sidebar.button("Atualizar dados"): st.cache_data.clear()
 
 # =========================
-# CARREGAR DADOS (duas contas)
+# CARREGAR DADOS (somente se já houver refresh)
 # =========================
 errors: List[str] = []
 dfs: List[pd.DataFrame] = []
 
 # TS
-try:
-    df_ts, new_r_ts = fetch_orders(st.secrets["TS_CLIENT_ID"], st.secrets["TS_CLIENT_SECRET"],
-                                   st.session_state["refresh_ts"], date_start, date_end, loja_id_val)
-    if new_r_ts: st.session_state["refresh_ts"] = new_r_ts
-    df_ts["account"] = "Loja Tiburcio's Stuff"
-    dfs.append(df_ts)
-except Exception as e:
-    errors.append(f"Loja Tiburcio's Stuff: {e}")
+if st.session_state["refresh_ts"]:
+    try:
+        df_ts, new_r_ts = fetch_orders(st.secrets["TS_CLIENT_ID"], st.secrets["TS_CLIENT_SECRET"],
+                                       st.session_state["refresh_ts"], date_start, date_end, loja_id_val)
+        if new_r_ts: st.session_state["refresh_ts"] = new_r_ts
+        df_ts["account"] = "Loja Tiburcio's Stuff"
+        dfs.append(df_ts)
+    except Exception as e:
+        errors.append(f"Loja Tiburcio's Stuff: {e}")
+else:
+    with st.expander("Avisos/Erros de integração", expanded=True):
+        st.info("Autorize a conta **TS** para carregar as vendas (clique em Autorizar TS).")
 
 # Bazar
-try:
-    df_bz, new_r_bz = fetch_orders(st.secrets["BAZAR_CLIENT_ID"], st.secrets["BAZAR_CLIENT_SECRET"],
-                                   st.session_state["refresh_bazar"], date_start, date_end, loja_id_val)
-    if new_r_bz: st.session_state["refresh_bazar"] = new_r_bz
-    df_bz["account"] = "TS Bazar"
-    dfs.append(df_bz)
-except Exception as e:
-    errors.append(f"TS Bazar: {e}")
+if st.session_state["refresh_bazar"]:
+    try:
+        df_bz, new_r_bz = fetch_orders(st.secrets["BAZAR_CLIENT_ID"], st.secrets["BAZAR_CLIENT_SECRET"],
+                                       st.session_state["refresh_bazar"], date_start, date_end, loja_id_val)
+        if new_r_bz: st.session_state["refresh_bazar"] = new_r_bz
+        df_bz["account"] = "TS Bazar"
+        dfs.append(df_bz)
+    except Exception as e:
+        errors.append(f"TS Bazar: {e}")
+else:
+    with st.expander("Avisos/Erros de integração", expanded=True):
+        st.info("Autorize a conta **Bazar** para carregar as vendas (clique em Autorizar Bazar).")
 
 df_all = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
