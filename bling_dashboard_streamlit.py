@@ -2,10 +2,10 @@
 """
 Bling Dashboard – 2 lojas
 --------------------------------
-- Client ID / Secret via Secrets (Streamlit)
+- Client ID / Secret via Secrets (Streamlit Cloud)
 - Refresh token inicial no código (um por loja)
 - Auto-refresh em memória (session_state)
-- Botões de autorização + captura automática do ?code= (sem colar manual)
+- Botões de autorização + captura automática do ?code= com 'state'
 """
 
 from __future__ import annotations
@@ -19,13 +19,11 @@ import streamlit as st
 from urllib.parse import urlencode
 
 # =========================
-# CONFIG
+# CONFIG BÁSICA
 # =========================
-APP_BASE = st.secrets.get("APP_BASE", st.runtime.get_instance()._runtime._get_websocket_url().split("/stream")[0] if hasattr(st.runtime.get_instance(), "_runtime") else "")
-if not APP_BASE.startswith("http"):
-    # fallback para o domínio padrão do Streamlit quando não há APP_BASE nos secrets
-    APP_BASE = "https://dashboard-ts.streamlit.app"  # <-- troque se quiser
-REDIRECT_URI = APP_BASE  # precisa ser igual ao cadastrado no Bling
+# Informe o domínio do seu app nos Secrets como APP_BASE (ex.: https://dashboard-ts.streamlit.app).
+APP_BASE = st.secrets.get("APP_BASE", "https://dashboard-ts.streamlit.app")
+REDIRECT_URI = APP_BASE  # Precisa ser exatamente o mesmo cadastrado no Bling
 
 TOKEN_URL  = "https://www.bling.com.br/Api/v3/oauth/token"
 AUTH_URL   = "https://www.bling.com.br/Api/v3/oauth/authorize"
@@ -33,14 +31,14 @@ ORDERS_URL = "https://www.bling.com.br/Api/v3/pedidos/vendas"
 DEFAULT_LIMIT = 100
 
 # ===== Cole SOMENTE os refresh tokens iniciais =====
-REFRESH_TS    = "COLOQUE_AQUI_O_REFRESH_TOKEN_TS"     # Loja Tiburcio's Stuff
-REFRESH_BAZAR = "COLOQUE_AQUI_O_REFRESH_TOKEN_BAZAR"  # TS Bazar
+REFRESH_TS    = "COLE_AQUI_O_REFRESH_TOKEN_TS"      # Loja Tiburcio's Stuff
+REFRESH_BAZAR = "COLE_AQUI_O_REFRESH_TOKEN_BAZAR"   # TS Bazar
 
 st.set_page_config(page_title="Dashboard de vendas – Bling API v3", layout="wide")
 st.title("📊 Dashboard de vendas – Bling API v3")
 
 # =========================
-# STATE
+# STATE – guarda refresh em memória
 # =========================
 if "refresh_ts" not in st.session_state:    st.session_state["refresh_ts"] = REFRESH_TS
 if "refresh_bazar" not in st.session_state: st.session_state["refresh_bazar"] = REFRESH_BAZAR
@@ -53,7 +51,7 @@ def auth_link(client_id: str, state: str) -> str:
         "response_type": "code",
         "client_id": client_id,
         "redirect_uri": REDIRECT_URI,
-        "state": state,
+        "state": state,  # 'auth-ts' ou 'auth-bazar'
     })
 
 def exchange_code_for_tokens(client_id: str, client_secret: str, code: str) -> dict:
@@ -111,8 +109,7 @@ def fetch_orders(client_id: str, client_secret: str, refresh_token: str,
 
     def safe(d, *keys, default=None):
         cur = d
-        for k in keys:
-            cur = None if cur is None else cur.get(k)
+        for k in keys: cur = None if cur is None else cur.get(k)
         return default if cur is None else cur
 
     recs = []
@@ -132,10 +129,9 @@ def fetch_orders(client_id: str, client_secret: str, refresh_token: str,
     return df, maybe_new_refresh
 
 # =========================
-# SIDEBAR – Botões de autorização (links)
+# SIDEBAR – Botões de autorização
 # =========================
 st.sidebar.header("Configurar contas (OAuth)")
-
 colb1, colb2 = st.sidebar.columns(2)
 try:
     colb1.link_button("Autorizar TS", auth_link(st.secrets["TS_CLIENT_ID"], "auth-ts"))
@@ -146,32 +142,32 @@ try:
 except Exception:
     colb2.write("Falta BAZAR_CLIENT_ID/SECRET nos Secrets")
 
-# 🔄 Captura automática do ?code= e troca sem colar nada
-code = st.query_params.get("code", None)
+# 🔄 Captura automática do ?code= e troca usando o 'state'
+code  = st.query_params.get("code", None)
 state = st.query_params.get("state", None)
-if code:
-    # Tenta TS, depois Bazar – o que aceitar primeiro define a conta
-    tried = []
-    for label in ("TS", "BAZAR"):
-        try:
-            cid = st.secrets[f"{label}_CLIENT_ID"]
-            csec = st.secrets[f"{label}_CLIENT_SECRET"]
-            j = exchange_code_for_tokens(cid, csec, code)
-            new_ref = j.get("refresh_token")
-            if label == "TS" and new_ref:
-                st.session_state["refresh_ts"] = new_ref
-                st.success("TS autorizado e refresh_token atualizado!")
-            elif label == "BAZAR" and new_ref:
-                st.session_state["refresh_bazar"] = new_ref
-                st.success("Bazar autorizado e refresh_token atualizado!")
-            # Limpa a query para não repetir a troca
-            st.query_params.clear()
-            st.experimental_rerun()
-        except Exception as e:
-            tried.append(str(e))
-    # Se chegou aqui é porque nenhum aceitou o code (expirado/redirect diferente)
-    st.error("Não foi possível trocar o code por tokens. Verifique se o Redirect URI no Bling é exatamente o URL do app.")
-    st.caption("Detalhes: " + " | ".join(tried))
+if code and state == "auth-ts":
+    try:
+        j = exchange_code_for_tokens(st.secrets["TS_CLIENT_ID"], st.secrets["TS_CLIENT_SECRET"], code)
+        new_ref = j.get("refresh_token")
+        if new_ref: st.session_state["refresh_ts"] = new_ref
+        st.success("TS autorizado e refresh_token atualizado!")
+    except Exception as e:
+        st.error(f"Não foi possível autorizar TS: {e}")
+    finally:
+        st.query_params.clear()
+        st.rerun()
+
+elif code and state == "auth-bazar":
+    try:
+        j = exchange_code_for_tokens(st.secrets["BAZAR_CLIENT_ID"], st.secrets["BAZAR_CLIENT_SECRET"], code)
+        new_ref = j.get("refresh_token")
+        if new_ref: st.session_state["refresh_bazar"] = new_ref
+        st.success("Bazar autorizado e refresh_token atualizado!")
+    except Exception as e:
+        st.error(f"Não foi possível autorizar Bazar: {e}")
+    finally:
+        st.query_params.clear()
+        st.rerun()
 
 # =========================
 # FILTROS
