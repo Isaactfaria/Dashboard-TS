@@ -126,43 +126,36 @@ def fetch_orders(client_id: str, client_secret: str, refresh_token: str,
 # SIDEBAR – Botões de autorização
 # =========================
 st.sidebar.header("Configurar contas (OAuth)")
+
+def auth_link(client_id: str, state: str) -> str:
+    from urllib.parse import urlencode
+    return "https://www.bling.com.br/Api/v3/oauth/authorize?" + urlencode({
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": REDIRECT_URI,   # precisa bater com o Bling
+        "state": state,                 # 'auth-ts' ou 'auth-bazar'
+    })
+
+# Mostra o REDIRECT_URI efetivo
+st.sidebar.caption(f"Redirect em uso: {REDIRECT_URI}")
+
 colb1, colb2 = st.sidebar.columns(2)
 try:
-    colb1.link_button("Autorizar TS", auth_link(st.secrets["TS_CLIENT_ID"], "auth-ts"))
+    ts_url = auth_link(st.secrets["TS_CLIENT_ID"], "auth-ts")
+    colb1.link_button("Autorizar TS", ts_url)
 except Exception:
     colb1.write("Falta TS_CLIENT_ID/SECRET nos Secrets")
+
 try:
-    colb2.link_button("Autorizar Bazar", auth_link(st.secrets["BAZAR_CLIENT_ID"], "auth-bazar"))
+    bz_url = auth_link(st.secrets["BAZAR_CLIENT_ID"], "auth-bazar")
+    colb2.link_button("Autorizar Bazar", bz_url)
 except Exception:
     colb2.write("Falta BAZAR_CLIENT_ID/SECRET nos Secrets")
 
-# 🔄 Captura automática do ?code= e troca usando o 'state'
-code  = st.query_params.get("code", None)
-state = st.query_params.get("state", None)
-
-if code and state == "auth-ts":
-    try:
-        j = exchange_code_for_tokens(st.secrets["TS_CLIENT_ID"], st.secrets["TS_CLIENT_SECRET"], code)
-        new_ref = j.get("refresh_token")
-        if new_ref: st.session_state["refresh_ts"] = new_ref
-        st.success("TS autorizado e refresh_token atualizado!")
-    except Exception as e:
-        st.error(f"Não foi possível autorizar TS: {e}")
-    finally:
-        st.query_params.clear()
-        st.rerun()
-
-elif code and state == "auth-bazar":
-    try:
-        j = exchange_code_for_tokens(st.secrets["BAZAR_CLIENT_ID"], st.secrets["BAZAR_CLIENT_SECRET"], code)
-        new_ref = j.get("refresh_token")
-        if new_ref: st.session_state["refresh_bazar"] = new_ref
-        st.success("Bazar autorizado e refresh_token atualizado!")
-    except Exception as e:
-        st.error(f"Não foi possível autorizar Bazar: {e}")
-    finally:
-        st.query_params.clear()
-        st.rerun()
+# Para debugging: mostra os URLs de autorização para copiar/colar manualmente se o botão não abrir
+with st.sidebar.expander("Ver URLs de autorização (debug)"):
+    st.code(ts_url if "ts_url" in locals() else "—", language="text")
+    st.code(bz_url if "bz_url" in locals() else "—", language="text")
 
 # =========================
 # FILTROS
@@ -255,3 +248,4 @@ with colB:
 
 st.subheader("Tabela de pedidos")
 st.dataframe(df_all.sort_values("data", ascending=False))
+
