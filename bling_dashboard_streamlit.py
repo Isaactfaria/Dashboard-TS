@@ -1,224 +1,123 @@
 # bling_dashboard_streamlit.py
 # -*- coding: utf-8 -*-
 """
-MVP de dashboard para vendas do Bling (API v3) em Streamlit.
+Bling Dashboard – Cloud Ready (Streamlit)
+----------------------------------------
+• Lê credenciais das Secrets do Streamlit Cloud
+• Área de configuração OAuth dentro do próprio app (gera refresh_token)
+• Suporta múltiplas contas (TS e TS Bazar) via secrets
+• KPIs + séries + tabela
 
-• Autenticação: OAuth2 usando refresh_token (gerado após a 1ª autorização do app no Bling).
-• Suporta múltiplas contas (ex.: sua loja e a da sua esposa). Configure via st.secrets ou config.yaml.
-• Endpoints usados: /Api/v3/oauth/token (refresh) e /Api/v3/pedidos/vendas (listar vendas).
-• Paginação: pagina & limite (ver Boas práticas da API v3 do Bling).
+Secrets esperadas (Settings → Secrets):
+TS_CLIENT_ID, TS_CLIENT_SECRET, TS_REFRESH_TOKEN
+BAZAR_CLIENT_ID, BAZAR_CLIENT_SECRET, BAZAR_REFRESH_TOKEN
 
-Como rodar:
-1) pip install streamlit pydantic requests pyyaml python-dateutil pandas
-2) Configure as contas em .streamlit/secrets.toml (ou crie um config.yaml na mesma pasta; exemplo ao final do arquivo).
-3) streamlit run bling_dashboard_streamlit.py
-
-Atenção:
-- Você precisa criar um APLICATIVO no portal de desenvolvedores do Bling, autorizar nas DUAS contas
-  (a sua e a da sua esposa) e capturar o refresh_token de cada instalação.
-- O app abaixo NUNCA expõe client_secret nem tokens no front; tudo roda no servidor local do Streamlit.
+Redirect URI no Bling: use exatamente a URL do app, ex.: https://dashboard-ts.streamlit.app
 """
-
 from __future__ import annotations
-import base64
 import datetime as dt
-from dataclasses import dataclass
 from dateutil.relativedelta import relativedelta
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
 import streamlit as st
-import yaml
 
-BLING_BASE = "https://www.bling.com.br/Api/v3"
-TOKEN_URL = f"{BLING_BASE}/oauth/token"
-ORDERS_URL = f"{BLING_BASE}/pedidos/vendas"
-DEFAULT_LIMIT = 100  # limite por página conforme padrão do Bling
+# =========================
+# CONFIG BÁSICA
+# =========================
+APP_BASE = st.secrets.get("APP_BASE", "https://dashboard-ts.streamlit.app")  # troque nos Secrets, se quiser
+REDIRECT_URI = APP_BASE  # precisa bater 100% com o cadastrado no Bling
+AUTH_URL = "https://www.bling.com.br/Api/v3/oauth/authorize"
+TOKEN_URL = "https://www.bling.com.br/Api/v3/oauth/token"
+ORDERS_URL = "https://www.bling.com.br/Api/v3/pedidos/vendas"
+DEFAULT_LIMIT = 100
 
-# ---------------------------
-# Config & Models
-# ---------------------------
-@dataclass
-class Account:
-    name: str
-    client_id: str
-    client_secret: str
-    refresh_token: str
+st.set_page_config(page_title="Dashboard de vendas – Bling API v3 (MVP)", layout="wide")
+st.title("📊 Dashboard de vendas – Bling API v3 (MVP)")
 
-    # stateful (preenchidos em runtime)
-    access_token: Optional[str] = None
-    access_token_exp: Optional[dt.datetime] = None
+# =========================
+# HELPERS OAUTH
+# =========================
 
-
-def load_config(path: str = "config.yaml") -> List[Account]:
-    with open(path, "r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f) or {}
-    accounts = []
-    for a in raw.get("accounts", []):
-        accounts.append(Account(
-            name=a["name"],
-            client_id=a["client_id"],
-            client_secret=a["client_secret"],
-            refresh_token=a["refresh_token"],
-        ))
-    if not accounts:
-        raise RuntimeError("Nenhuma conta encontrada no config.yaml > accounts[].")
-    return accounts
-
-
-def load_accounts() -> List[Account]:
-    """Carrega contas a partir de st.secrets (se disponível) ou cai no config.yaml.
-    
-    Formatos suportados em st.secrets:
-    1) accounts = [ { name, client_id, client_secret, refresh_token }, ... ]
-    2) Chaves pontuais, por exemplo:
-       TS_CLIENT_ID, TS_CLIENT_SECRET, TS_REFRESH_TOKEN
-       BAZAR_CLIENT_ID, BAZAR_CLIENT_SECRET, BAZAR_REFRESH_TOKEN
-    """
-    accs: List[Account] = []
-    try:
-        secrets = st.secrets
-    except Exception:
-        secrets = {}
-    # Formato 1: lista de contas em st.secrets["accounts"]
-    try:
-        if secrets and "accounts" in secrets and isinstance(secrets["accounts"], (list, tuple)):
-            for a in secrets["accounts"]:
-                accs.append(Account(
-                    name=a["name"],
-                    client_id=a["client_id"],
-                    client_secret=a["client_secret"],
-                    refresh_token=a["refresh_token"],
-                ))
-    except Exception:
-        # ignora e tenta outros formatos
-        pass
-    # Formato 2: pares de chaves com prefixo
-    def _from_prefix(prefix: str, default_name: str) -> Optional[Account]:
-        cid = secrets.get(f"{prefix}_CLIENT_ID") if secrets else None
-        csec = secrets.get(f"{prefix}_CLIENT_SECRET") if secrets else None
-        rtk = secrets.get(f"{prefix}_REFRESH_TOKEN") if secrets else None
-        if cid and csec and rtk:
-            return Account(name=default_name, client_id=cid, client_secret=csec, refresh_token=rtk)
-        return None
-    if secrets and not accs:
-        # Exemplos comuns
-        for prefix, nm in [("TS", "Loja Tiburcio's Stuff"), ("BAZAR", "TS Bazar")]:
-            maybe = _from_prefix(prefix, nm)
-            if maybe:
-                accs.append(maybe)
-    if accs:
-        return accs
-    # fallback: config.yaml
-    return load_config()
-
-
-# ---------------------------
-# OAuth helpers
-# ---------------------------
-
-def _basic_auth_header(client_id: str, client_secret: str) -> str:
-    token = f"{client_id}:{client_secret}".encode("utf-8")
-    return "Basic " + base64.b64encode(token).decode("ascii")
-
-
-def refresh_access_token(acc: Account) -> Tuple[str, dt.datetime]:
-    """Usa o refresh_token para obter um novo access_token (expira em ~6h)."""
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Accept": "1.0",
-        "Authorization": _basic_auth_header(acc.client_id, acc.client_secret),
+def make_auth_link(client_id: str, state: str) -> str:
+    from urllib.parse import urlencode
+    q = {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": REDIRECT_URI,
+        "state": state,
     }
-    data = {
-        "grant_type": "refresh_token",
-        "refresh_token": acc.refresh_token,
-    }
-    resp = requests.post(TOKEN_URL, headers=headers, data=data, timeout=30)
+    return AUTH_URL + "?" + urlencode(q)
+
+
+def exchange_code_for_tokens(client_id: str, client_secret: str, code: str) -> Dict:
+    resp = requests.post(
+        TOKEN_URL,
+        auth=(client_id, client_secret),
+        data={"grant_type": "authorization_code", "code": code, "redirect_uri": REDIRECT_URI},
+        timeout=30,
+    )
     if resp.status_code != 200:
-        raise RuntimeError(f"Falha no refresh token de {acc.name}: {resp.status_code} – {resp.text}")
+        raise RuntimeError(f"Falha na troca de code (HTTP {resp.status_code}) – {resp.text}")
+    return resp.json()
+
+
+def refresh_access_token(client_id: str, client_secret: str, refresh_token: str) -> Tuple[str, Optional[str], int]:
+    resp = requests.post(
+        TOKEN_URL,
+        auth=(client_id, client_secret),
+        data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Falha no refresh token: {resp.status_code} – {resp.text}")
     j = resp.json()
-    access = j["access_token"]
-    expires_in = int(j.get("expires_in", 21600))  # segundos (doc Bling)
-    exp_at = dt.datetime.utcnow() + dt.timedelta(seconds=expires_in - 60)
-    # Atualiza refresh_token se o Bling devolver um novo
-    if j.get("refresh_token") and j["refresh_token"] != acc.refresh_token:
-        acc.refresh_token = j["refresh_token"]
-    return access, exp_at
+    return j.get("access_token", ""), j.get("refresh_token"), int(j.get("expires_in", 21600))
 
 
-def get_access_token(acc: Account) -> str:
-    if not acc.access_token or not acc.access_token_exp or dt.datetime.utcnow() > acc.access_token_exp:
-        acc.access_token, acc.access_token_exp = refresh_access_token(acc)
-    return acc.access_token
-
-
-# ---------------------------
-# API fetchers
-# ---------------------------
-
-def fetch_orders(acc: Account, date_start: dt.date, date_end: dt.date,
-                 loja_id: Optional[int] = None,
-                 limite: int = DEFAULT_LIMIT,
-                 max_pages: int = 200) -> List[Dict]:
-    """Busca pedidos de venda no intervalo [date_start, date_end].
-    Usa paginação; retorna lista de dicts de pedidos brutos.
-    """
-    bearer = get_access_token(acc)
-    all_rows: List[Dict] = []
-    pagina = 1
-    params_base = {
+# =========================
+# BUSCA DE VENDAS
+# =========================
+@st.cache_data(ttl=300)
+def fetch_orders(client_id: str, client_secret: str, refresh_token: str,
+                 date_start: dt.date, date_end: dt.date,
+                 loja_id: Optional[int] = None) -> pd.DataFrame:
+    access, maybe_new_refresh, _ = refresh_access_token(client_id, client_secret, refresh_token)
+    headers = {"Authorization": f"Bearer {access}"}
+    params = {
         "dataInicial": date_start.strftime("%Y-%m-%d"),
         "dataFinal": date_end.strftime("%Y-%m-%d"),
-        "limite": limite,
+        "limite": DEFAULT_LIMIT,
+        "pagina": 1,
     }
     if loja_id is not None:
-        params_base["idLoja"] = loja_id
+        params["idLoja"] = loja_id
 
-    while pagina <= max_pages:
-        params = dict(params_base)
-        params["pagina"] = pagina
-        r = requests.get(ORDERS_URL, headers={"Authorization": f"Bearer {bearer}"}, params=params, timeout=30)
-        if r.status_code == 401:
-            # token expirou no meio – força refresh e repete esta página
-            acc.access_token = None
-            bearer = get_access_token(acc)
-            r = requests.get(ORDERS_URL, headers={"Authorization": f"Bearer {bearer}"}, params=params, timeout=30)
+    all_rows = []
+    while True:
+        r = requests.get(ORDERS_URL, headers=headers, params=params, timeout=30)
         if r.status_code != 200:
-            raise RuntimeError(f"Erro ao listar pedidos ({acc.name}) p{pagina}: {r.status_code} – {r.text}")
+            raise RuntimeError(f"Erro ao listar pedidos p{params['pagina']}: {r.status_code} – {r.text}")
         data = r.json()
         rows = data if isinstance(data, list) else data.get("data") or data.get("itens") or []
         if not rows:
             break
         all_rows.extend(rows)
-        # Heurística: se retornou menos que o limite, acabou; senão incrementa página
-        if len(rows) < limite:
+        if len(rows) < DEFAULT_LIMIT:
             break
-        pagina += 1
-    return all_rows
+        params["pagina"] += 1
 
-
-# ---------------------------
-# Transformações
-# ---------------------------
-
-def normalize_orders(raw_rows: List[Dict], account_name: str) -> pd.DataFrame:
-    """Normaliza campos essenciais do pedido de venda."""
-    if not raw_rows:
-        return pd.DataFrame(columns=[
-            "account", "id", "data", "numero", "numeroLoja", "total",
-            "contato_id", "vendedor_id", "loja_id",
-        ])
-    def safe(d: Dict, *keys, default=None):
+    # Normalização essencial
+    def safe(d, *keys, default=None):
         cur = d
         for k in keys:
             cur = None if cur is None else cur.get(k)
         return default if cur is None else cur
 
     recs = []
-    for x in raw_rows:
+    for x in all_rows:
         recs.append({
-            "account": account_name,
             "id": x.get("id"),
             "data": x.get("data"),
             "numero": x.get("numero"),
@@ -229,87 +128,132 @@ def normalize_orders(raw_rows: List[Dict], account_name: str) -> pd.DataFrame:
             "loja_id": safe(x, "loja", "id"),
         })
     df = pd.DataFrame.from_records(recs)
-    # Tipagens e datas
     if not df.empty:
         df["data"] = pd.to_datetime(df["data"], errors="coerce")
         df["total"] = pd.to_numeric(df["total"], errors="coerce")
     return df
 
 
-def kpis(df: pd.DataFrame) -> Dict[str, float]:
-    if df.empty:
-        return {"Pedidos": 0, "Receita": 0.0, "Ticket médio": 0.0}
-    pedidos = int(df.shape[0])
-    receita = float(df["total"].sum())
-    ticket = float(receita / pedidos) if pedidos else 0.0
-    return {"Pedidos": pedidos, "Receita": receita, "Ticket médio": ticket}
+# =========================
+# UI – AUTORIZAÇÃO DENTRO DO APP
+# =========================
+with st.expander("⚙️ Avisos/Erros de integração", expanded=False):
+    st.write("Se der 'invalid_grant: Invalid refresh token', gere um refresh_token novo clicando em Autorizar abaixo e cole nos Secrets.")
 
+st.sidebar.header("Configurar contas (OAuth)")
+colA, colB = st.sidebar.columns(2)
 
-# ---------------------------
-# UI (Streamlit)
-# ---------------------------
-st.set_page_config(page_title="Bling – Vendas", layout="wide")
-st.title("📊 Dashboard de Vendas – Bling API v3 (MVP)")
+# Links de autorização
+try:
+    ts_link = make_auth_link(st.secrets["TS_CLIENT_ID"], "auth-ts")
+    colA.link_button("Autorizar TS", ts_link)
+except Exception:
+    colA.write("Preencha TS_CLIENT_ID nos Secrets")
 
+try:
+    bazar_link = make_auth_link(st.secrets["BAZAR_CLIENT_ID"], "auth-bazar")
+    colB.link_button("Autorizar Bazar", bazar_link)
+except Exception:
+    colB.write("Preencha BAZAR_CLIENT_ID nos Secrets")
+
+# Captura de code pela URL do app
+query_params = st.query_params
+code = query_params.get("code", None)
+if code:
+    st.info("Recebi o código do Bling. Trocando por tokens…")
+    tried = []
+    for label in ("TS", "BAZAR"):
+        try:
+            cid = st.secrets[f"{label}_CLIENT_ID"]
+            csec = st.secrets[f"{label}_CLIENT_SECRET"]
+            j = exchange_code_for_tokens(cid, csec, code)
+            st.success(f"✅ {('Loja Tiburcio\'s Stuff' if label=='TS' else 'TS Bazar')} autorizada!")
+            st.write("Cole este **refresh_token** nos Secrets e clique Rerun:")
+            st.code(j.get("refresh_token", "(sem refresh_token)"), language="text")
+            st.write("(Opcional) access_token para teste imediato:")
+            st.code(j.get("access_token", ""), language="text")
+            st.stop()
+        except Exception as e:
+            tried.append(str(e))
+    st.error("Não consegui trocar o code por tokens. Verifique se o redirect_uri no Bling é exatamente o URL do app.")
+    st.caption("Detalhes: " + " | ".join(tried))
+
+# =========================
+# FORM DE FILTROS
+# =========================
 st.sidebar.header("Filtros")
 DEFAULT_START = (dt.date.today() - relativedelta(months=1)).replace(day=1)
 DEFAULT_END = dt.date.today()
-
 col1, col2 = st.sidebar.columns(2)
 with col1:
     date_start = st.date_input("Data inicial", value=DEFAULT_START)
 with col2:
     date_end = st.date_input("Data final", value=DEFAULT_END)
-
-loja_id = st.sidebar.text_input("ID da Loja (opcional)")
-loja_id_val = int(loja_id) if loja_id.strip().isdigit() else None
-
-st.sidebar.caption("Para filtrar por loja específica, informe o ID conforme cadastro no Bling.")
-
-# Carrega contas (st.secrets ou config.yaml)
-try:
-    accounts = load_accounts()
-except Exception as e:
-    st.error(f"Erro ao carregar contas (st.secrets/config.yaml): {e}")
-    st.stop()
+loja_id_str = st.sidebar.text_input("ID da Loja (opcional)")
+loja_id_val = int(loja_id_str) if loja_id_str.strip().isdigit() else None
 
 if st.sidebar.button("Atualizar dados"):
-    st.session_state.pop("df_all", None)
+    st.cache_data.clear()
 
-@st.cache_data(ttl=300)
-def load_data_cached(_accounts: List[Account], _start: dt.date, _end: dt.date, _loja: Optional[int]):
-    dfs = []
-    errors = []
-    for acc in _accounts:
-        try:
-            raw = fetch_orders(acc, _start, _end, loja_id=_loja)
-            df = normalize_orders(raw, acc.name)
-            dfs.append(df)
-        except Exception as ex:
-            errors.append(f"{acc.name}: {ex}")
-    df_all = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-    return df_all, errors
+# =========================
+# MONTAGEM DAS CONTAS A PARTIR DOS SECRETS
+# =========================
+accounts: List[Dict] = []
+if all(k in st.secrets for k in ("TS_CLIENT_ID","TS_CLIENT_SECRET","TS_REFRESH_TOKEN")):
+    accounts.append({
+        "name": "Loja Tiburcio's Stuff",
+        "client_id": st.secrets["TS_CLIENT_ID"],
+        "client_secret": st.secrets["TS_CLIENT_SECRET"],
+        "refresh_token": st.secrets["TS_REFRESH_TOKEN"],
+    })
+if all(k in st.secrets for k in ("BAZAR_CLIENT_ID","BAZAR_CLIENT_SECRET","BAZAR_REFRESH_TOKEN")):
+    accounts.append({
+        "name": "TS Bazar",
+        "client_id": st.secrets["BAZAR_CLIENT_ID"],
+        "client_secret": st.secrets["BAZAR_CLIENT_SECRET"],
+        "refresh_token": st.secrets["BAZAR_REFRESH_TOKEN"],
+    })
 
-with st.spinner("Buscando pedidos no Bling..."):
-    df_all, errs = load_data_cached(accounts, date_start, date_end, loja_id_val)
+if not accounts:
+    st.warning("Configure os Secrets das contas (CLIENT_ID/CLIENT_SECRET/REFRESH_TOKEN) e recarregue o app.")
+    st.stop()
 
-if errs:
-    with st.expander("Avisos/Erros de integração", expanded=False):
-        for e in errs:
+# =========================
+# CARREGAR DADOS
+# =========================
+errors = []
+dfs = []
+for acc in accounts:
+    try:
+        df = fetch_orders(acc["client_id"], acc["client_secret"], acc["refresh_token"],
+                          date_start, date_end, loja_id_val)
+        df["account"] = acc["name"]
+        dfs.append(df)
+    except Exception as e:
+        errors.append(f"{acc['name']}: {e}")
+
+df_all = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+if errors:
+    with st.expander("Avisos/Erros de integração", expanded=True):
+        for e in errors:
             st.warning(e)
 
 if df_all.empty:
     st.info("Nenhum pedido encontrado para os filtros informados.")
     st.stop()
 
-# KPIs
-metrics = kpis(df_all)
-mc1, mc2, mc3 = st.columns(3)
-mc1.metric("Pedidos", f"{metrics['Pedidos']:,}".replace(",","."))
-mc2.metric("Receita", f"R$ {metrics['Receita']:,.2f}".replace(",","#").replace(".",",").replace("#","."))
-mc3.metric("Ticket médio", f"R$ {metrics['Ticket médio']:,.2f}".replace(",","#").replace(".",",").replace("#","."))
+# =========================
+# KPIs E VISUALIZAÇÕES
+# =========================
+metrics_cols = st.columns(3)
+qtd = int(df_all.shape[0])
+receita = float(df_all["total"].sum()) if not df_all.empty else 0.0
+ticket = float(receita / qtd) if qtd else 0.0
+metrics_cols[0].metric("Pedidos", f"{qtd:,}".replace(",","."))
+metrics_cols[1].metric("Receita", f"R$ {receita:,.2f}".replace(",","#").replace(".",",").replace("#","."))
+metrics_cols[2].metric("Ticket médio", f"R$ {ticket:,.2f}".replace(",","#").replace(".",",").replace("#","."))
 
-# Séries de tempo
 st.subheader("Vendas por dia")
 by_day = (
     df_all.assign(dia=df_all["data"].dt.date)
@@ -317,12 +261,12 @@ by_day = (
 )
 st.line_chart(by_day.pivot(index="dia", columns="account", values="total"))
 
-# Top lojas (IDs) e top pedidos por valor
 colA, colB = st.columns([2, 1])
 with colA:
     st.subheader("Receita por loja (ID)")
-    by_loja = df_all.groupby("loja_id", as_index=False)["total"].sum().sort_values("total", ascending=False)
-    st.bar_chart(by_loja.set_index("loja_id"))
+    by_loja = df_all.groupby(["loja_id"], as_index=False)["total"].sum().sort_values("total", ascending=False)
+    if not by_loja.empty:
+        st.bar_chart(by_loja.set_index("loja_id"))
 with colB:
     st.subheader("Top 10 pedidos")
     top10 = df_all.sort_values("total", ascending=False).head(10)
@@ -330,25 +274,3 @@ with colB:
 
 st.subheader("Tabela de pedidos")
 st.dataframe(df_all.sort_values("data", ascending=False))
-
-st.caption(
-    """
-    • Fonte: Bling API v3 – endpoint /pedidos/vendas (Bearer).\n
-    • Paginação: parâmetros 'pagina' e 'limite'.\n
-    • Para dados em tempo quase real, recomendo ativar Webhooks para 'Pedido de Venda' e alimentar um banco (ex.: SQLite/Postgres) – próximo passo.
-    """
-)
-
-# ---------------------------
-# Exemplo de config.yaml
-# ---------------------------
-#
-# accounts:
-#   - name: "Loja Tiburcio's Stuff"
-#     client_id: "SEU_CLIENT_ID"
-#     client_secret: "SEU_CLIENT_SECRET"
-#     refresh_token: "SEU_REFRESH_TOKEN"
-#   - name: "Loja Esposa"
-#     client_id: "CLIENT_ID_DELA"
-#     client_secret: "CLIENT_SECRET_DELA"
-#     refresh_token: "REFRESH_TOKEN_DELA"
