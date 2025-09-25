@@ -1,0 +1,13 @@
+accounts:
+- name: Loja Tiburcio's Stuff
+  client_id: 48831318d181633f4751ac7f63fc716ff50ef259
+  client_secret: 243fc9583cb9814b61e1ea491e754538ede9d09c8c90e9d2eb959a96c512
+  refresh_token: SEU_REFRESH_TOKEN
+- name: Tiburcio's Stuff
+  client_id: 48831318d181633f4751ac7f63fc716ff50ef259
+  client_secret: 243fc9583cb9814b61e1ea491e754538ede9d09c8c90e9d2eb959a96c512
+  refresh_token: 85a3f150d4b09a586d817d27107254064cc7fbc3
+- name: TS BAzar
+  client_id: 2b9d9677cf98c166950656fd9d7161795d499e58
+  client_secret: f3504e6d70c566bff108d0feabe4f477bab3be49b7198498ff57e730db89
+  refresh_token: 51b3faf58998cc4abbf545072af16f215b873105

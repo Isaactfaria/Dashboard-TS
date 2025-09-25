@@ -1,0 +1,6 @@
+streamlit
+requests
+pydantic
+pyyaml
+python-dateutil
+pandas
