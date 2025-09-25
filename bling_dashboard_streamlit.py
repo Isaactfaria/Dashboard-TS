@@ -2,12 +2,13 @@
 """
 Bling Dashboard – 2 lojas
 --------------------------------
-- Client ID / Secret via Secrets
-- Refresh token inicial no código
-- Auto-refresh em memória
-- Botões de validação para renovar tokens direto pelo app
+- Client ID / Secret via Secrets (Streamlit)
+- Refresh token inicial no código (um por loja)
+- Auto-refresh em memória (session_state)
+- Botões de autorização + captura automática do ?code= (sem colar manual)
 """
 
+from __future__ import annotations
 import datetime as dt
 from dateutil.relativedelta import relativedelta
 from typing import List, Optional, Tuple
@@ -15,67 +16,77 @@ from typing import List, Optional, Tuple
 import pandas as pd
 import requests
 import streamlit as st
+from urllib.parse import urlencode
 
-# =====================================================================
-# REFRESH TOKENS INICIAIS (cole aqui os que você já gerou!)
-# =====================================================================
-REFRESH_TS     = "COLE_AQUI_O_REFRESH_TOKEN_TS"
-REFRESH_BAZAR  = "COLE_AQUI_O_REFRESH_TOKEN_BAZAR"
+# =========================
+# CONFIG
+# =========================
+APP_BASE = st.secrets.get("APP_BASE", st.runtime.get_instance()._runtime._get_websocket_url().split("/stream")[0] if hasattr(st.runtime.get_instance(), "_runtime") else "")
+if not APP_BASE.startswith("http"):
+    # fallback para o domínio padrão do Streamlit quando não há APP_BASE nos secrets
+    APP_BASE = "https://dashboard-ts.streamlit.app"  # <-- troque se quiser
+REDIRECT_URI = APP_BASE  # precisa ser igual ao cadastrado no Bling
 
-# =====================================================================
-# ENDPOINTS BLING
-# =====================================================================
 TOKEN_URL  = "https://www.bling.com.br/Api/v3/oauth/token"
+AUTH_URL   = "https://www.bling.com.br/Api/v3/oauth/authorize"
 ORDERS_URL = "https://www.bling.com.br/Api/v3/pedidos/vendas"
 DEFAULT_LIMIT = 100
+
+# ===== Cole SOMENTE os refresh tokens iniciais =====
+REFRESH_TS    = "COLOQUE_AQUI_O_REFRESH_TOKEN_TS"     # Loja Tiburcio's Stuff
+REFRESH_BAZAR = "COLOQUE_AQUI_O_REFRESH_TOKEN_BAZAR"  # TS Bazar
 
 st.set_page_config(page_title="Dashboard de vendas – Bling API v3", layout="wide")
 st.title("📊 Dashboard de vendas – Bling API v3")
 
-# =====================================================================
-# STATE – refresh tokens são atualizados em memória
-# =====================================================================
-if "refresh_ts" not in st.session_state:
-    st.session_state["refresh_ts"] = REFRESH_TS
-if "refresh_bazar" not in st.session_state:
-    st.session_state["refresh_bazar"] = REFRESH_BAZAR
+# =========================
+# STATE
+# =========================
+if "refresh_ts" not in st.session_state:    st.session_state["refresh_ts"] = REFRESH_TS
+if "refresh_bazar" not in st.session_state: st.session_state["refresh_bazar"] = REFRESH_BAZAR
 
-# =====================================================================
-# FUNÇÕES DE TOKEN E BUSCA
-# =====================================================================
+# =========================
+# OAUTH HELPERS
+# =========================
+def auth_link(client_id: str, state: str) -> str:
+    return AUTH_URL + "?" + urlencode({
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": REDIRECT_URI,
+        "state": state,
+    })
+
+def exchange_code_for_tokens(client_id: str, client_secret: str, code: str) -> dict:
+    r = requests.post(
+        TOKEN_URL,
+        auth=(client_id, client_secret),
+        data={"grant_type": "authorization_code", "code": code, "redirect_uri": REDIRECT_URI},
+        timeout=30,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Falha na troca de code: {r.status_code} – {r.text}")
+    return r.json()
+
 def refresh_access_token(client_id: str, client_secret: str, refresh_token: str) -> Tuple[str, Optional[str]]:
-    """Gera um novo access_token a partir de um refresh_token.
-       Retorna (access_token, refresh_token_novo_ou_None)."""
-    resp = requests.post(
+    r = requests.post(
         TOKEN_URL,
         auth=(client_id, client_secret),
         data={"grant_type": "refresh_token", "refresh_token": refresh_token},
         timeout=30,
     )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Falha no refresh token: {resp.status_code} – {resp.text}")
-    j = resp.json()
+    if r.status_code != 200:
+        raise RuntimeError(f"Falha no refresh token: {r.status_code} – {r.text}")
+    j = r.json()
     return j.get("access_token", ""), j.get("refresh_token")
 
-def exchange_code_for_tokens(client_id: str, client_secret: str, code: str, redirect_uri: str):
-    """Troca um authorization code por tokens."""
-    resp = requests.post(
-        TOKEN_URL,
-        auth=(client_id, client_secret),
-        data={"grant_type": "authorization_code", "code": code, "redirect_uri": redirect_uri},
-        timeout=30,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Falha na troca de code: {resp.status_code} – {resp.text}")
-    return resp.json()
-
+# =========================
+# BUSCA DE VENDAS
+# =========================
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_orders(client_id: str, client_secret: str, refresh_token: str,
                  date_start: dt.date, date_end: dt.date,
                  loja_id: Optional[int] = None) -> Tuple[pd.DataFrame, Optional[str]]:
-    # 1) Refresh
     access, maybe_new_refresh = refresh_access_token(client_id, client_secret, refresh_token)
-    # 2) GET paginado
     headers = {"Authorization": f"Bearer {access}"}
     params = {
         "dataInicial": date_start.strftime("%Y-%m-%d"),
@@ -98,6 +109,12 @@ def fetch_orders(client_id: str, client_secret: str, refresh_token: str,
         if len(rows) < DEFAULT_LIMIT: break
         params["pagina"] += 1
 
+    def safe(d, *keys, default=None):
+        cur = d
+        for k in keys:
+            cur = None if cur is None else cur.get(k)
+        return default if cur is None else cur
+
     recs = []
     for x in all_rows:
         recs.append({
@@ -106,7 +123,7 @@ def fetch_orders(client_id: str, client_secret: str, refresh_token: str,
             "numero": x.get("numero"),
             "numeroLoja": x.get("numeroLoja"),
             "total": x.get("total"),
-            "loja_id": (x.get("loja") or {}).get("id"),
+            "loja_id": safe(x, "loja", "id"),
         })
     df = pd.DataFrame.from_records(recs)
     if not df.empty:
@@ -114,40 +131,51 @@ def fetch_orders(client_id: str, client_secret: str, refresh_token: str,
         df["total"] = pd.to_numeric(df["total"], errors="coerce")
     return df, maybe_new_refresh
 
-# =====================================================================
-# SIDEBAR – Filtros + Botões de autenticação
-# =====================================================================
+# =========================
+# SIDEBAR – Botões de autorização (links)
+# =========================
 st.sidebar.header("Configurar contas (OAuth)")
+
 colb1, colb2 = st.sidebar.columns(2)
-if colb1.button("Autorizar TS"):
-    st.info("Clique no link de autorização do Bling para TS e cole aqui o ?code=...")
-    st.session_state["waiting_code"] = "TS"
-if colb2.button("Autorizar Bazar"):
-    st.info("Clique no link de autorização do Bling para Bazar e cole aqui o ?code=...")
-    st.session_state["waiting_code"] = "BAZAR"
+try:
+    colb1.link_button("Autorizar TS", auth_link(st.secrets["TS_CLIENT_ID"], "auth-ts"))
+except Exception:
+    colb1.write("Falta TS_CLIENT_ID/SECRET nos Secrets")
+try:
+    colb2.link_button("Autorizar Bazar", auth_link(st.secrets["BAZAR_CLIENT_ID"], "auth-bazar"))
+except Exception:
+    colb2.write("Falta BAZAR_CLIENT_ID/SECRET nos Secrets")
 
-auth_code = st.sidebar.text_input("Cole aqui o código do Bling")
-if auth_code and "waiting_code" in st.session_state:
-    try:
-        if st.session_state["waiting_code"] == "TS":
-            j = exchange_code_for_tokens(
-                st.secrets["TS_CLIENT_ID"], st.secrets["TS_CLIENT_SECRET"], auth_code,
-                "https://dashboard-ts.streamlit.app"
-            )
-            st.session_state["refresh_ts"] = j.get("refresh_token")
-            st.success("TS autorizado com sucesso!")
-        elif st.session_state["waiting_code"] == "BAZAR":
-            j = exchange_code_for_tokens(
-                st.secrets["BAZAR_CLIENT_ID"], st.secrets["BAZAR_CLIENT_SECRET"], auth_code,
-                "https://dashboard-ts.streamlit.app"
-            )
-            st.session_state["refresh_bazar"] = j.get("refresh_token")
-            st.success("Bazar autorizado com sucesso!")
-        del st.session_state["waiting_code"]
-    except Exception as e:
-        st.error(f"Erro ao autorizar: {e}")
+# 🔄 Captura automática do ?code= e troca sem colar nada
+code = st.query_params.get("code", None)
+state = st.query_params.get("state", None)
+if code:
+    # Tenta TS, depois Bazar – o que aceitar primeiro define a conta
+    tried = []
+    for label in ("TS", "BAZAR"):
+        try:
+            cid = st.secrets[f"{label}_CLIENT_ID"]
+            csec = st.secrets[f"{label}_CLIENT_SECRET"]
+            j = exchange_code_for_tokens(cid, csec, code)
+            new_ref = j.get("refresh_token")
+            if label == "TS" and new_ref:
+                st.session_state["refresh_ts"] = new_ref
+                st.success("TS autorizado e refresh_token atualizado!")
+            elif label == "BAZAR" and new_ref:
+                st.session_state["refresh_bazar"] = new_ref
+                st.success("Bazar autorizado e refresh_token atualizado!")
+            # Limpa a query para não repetir a troca
+            st.query_params.clear()
+            st.experimental_rerun()
+        except Exception as e:
+            tried.append(str(e))
+    # Se chegou aqui é porque nenhum aceitou o code (expirado/redirect diferente)
+    st.error("Não foi possível trocar o code por tokens. Verifique se o Redirect URI no Bling é exatamente o URL do app.")
+    st.caption("Detalhes: " + " | ".join(tried))
 
-# Filtros
+# =========================
+# FILTROS
+# =========================
 st.sidebar.header("Filtros")
 DEFAULT_START = (dt.date.today() - relativedelta(months=1)).replace(day=1)
 DEFAULT_END   = dt.date.today()
@@ -158,23 +186,19 @@ with c2:
     date_end   = st.date_input("Data final",   value=DEFAULT_END)
 loja_id_str = st.sidebar.text_input("ID da Loja (opcional)")
 loja_id_val = int(loja_id_str) if loja_id_str.strip().isdigit() else None
-if st.sidebar.button("Atualizar dados"):
-    st.cache_data.clear()
+if st.sidebar.button("Atualizar dados"): st.cache_data.clear()
 
-# =====================================================================
-# EXECUÇÃO
-# =====================================================================
+# =========================
+# CARREGAR DADOS (duas contas)
+# =========================
 errors: List[str] = []
 dfs: List[pd.DataFrame] = []
 
 # TS
 try:
-    df_ts, new_r_ts = fetch_orders(
-        st.secrets["TS_CLIENT_ID"], st.secrets["TS_CLIENT_SECRET"], st.session_state["refresh_ts"],
-        date_start, date_end, loja_id_val
-    )
-    if new_r_ts:
-        st.session_state["refresh_ts"] = new_r_ts
+    df_ts, new_r_ts = fetch_orders(st.secrets["TS_CLIENT_ID"], st.secrets["TS_CLIENT_SECRET"],
+                                   st.session_state["refresh_ts"], date_start, date_end, loja_id_val)
+    if new_r_ts: st.session_state["refresh_ts"] = new_r_ts
     df_ts["account"] = "Loja Tiburcio's Stuff"
     dfs.append(df_ts)
 except Exception as e:
@@ -182,12 +206,9 @@ except Exception as e:
 
 # Bazar
 try:
-    df_bz, new_r_bz = fetch_orders(
-        st.secrets["BAZAR_CLIENT_ID"], st.secrets["BAZAR_CLIENT_SECRET"], st.session_state["refresh_bazar"],
-        date_start, date_end, loja_id_val
-    )
-    if new_r_bz:
-        st.session_state["refresh_bazar"] = new_r_bz
+    df_bz, new_r_bz = fetch_orders(st.secrets["BAZAR_CLIENT_ID"], st.secrets["BAZAR_CLIENT_SECRET"],
+                                   st.session_state["refresh_bazar"], date_start, date_end, loja_id_val)
+    if new_r_bz: st.session_state["refresh_bazar"] = new_r_bz
     df_bz["account"] = "TS Bazar"
     dfs.append(df_bz)
 except Exception as e:
@@ -203,9 +224,9 @@ if df_all.empty:
     st.info("Nenhum pedido encontrado para os filtros informados.")
     st.stop()
 
-# =====================================================================
+# =========================
 # KPIs
-# =====================================================================
+# =========================
 colM1, colM2, colM3 = st.columns(3)
 qtd     = int(df_all.shape[0])
 receita = float(df_all["total"].sum())
@@ -214,9 +235,9 @@ colM1.metric("Pedidos", f"{qtd:,}".replace(",", "."))
 colM2.metric("Receita", f"R$ {receita:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
 colM3.metric("Ticket médio", f"R$ {ticket:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
 
-# =====================================================================
+# =========================
 # GRÁFICOS/TABELAS
-# =====================================================================
+# =========================
 st.subheader("Vendas por dia")
 by_day = (df_all.assign(dia=df_all["data"].dt.date)
                  .groupby(["dia","account"], as_index=False)["total"].sum())
