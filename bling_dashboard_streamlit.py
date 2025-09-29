@@ -13,8 +13,8 @@ import requests
 import streamlit as st
 
 # ============== CONFIG ==============
-APP_BASE       = st.secrets.get("APP_BASE", "https://dashboard-ts.streamlit.app")
-TS_CLIENT_ID   = st.secrets["TS_CLIENT_ID"]
+APP_BASE         = st.secrets.get("APP_BASE", "https://dashboard-ts.streamlit.app")
+TS_CLIENT_ID     = st.secrets["TS_CLIENT_ID"]
 TS_CLIENT_SECRET = st.secrets["TS_CLIENT_SECRET"]
 
 AUTH_URL   = "https://www.bling.com.br/Api/v3/oauth/authorize"
@@ -39,7 +39,6 @@ def build_auth_link(client_id: str, state: str) -> str:
     })
 
 def post_with_backoff(url, auth, data, tries=3, wait=3):
-    """POST com pequeno backoff (protege contra flutuações e 429)."""
     for i in range(tries):
         r = requests.post(url, auth=auth, data=data, timeout=30)
         if r.status_code == 429 and i < tries - 1:
@@ -73,7 +72,7 @@ def refresh_access_token(refresh_token: str) -> Tuple[str, Optional[str]]:
     j = r.json()
     return j.get("access_token", ""), j.get("refresh_token")
 
-# ============== CAPTURA AUTOMÁTICA DO ?code= ==============
+# ============== CAPTURA AUTOMÁTICA DO ?code= (antes de desenhar as abas) ==============
 def normalize_qp(d: dict) -> dict:
     return {k: (v[0] if isinstance(v, list) else v) for k, v in d.items()}
 
@@ -85,7 +84,7 @@ def auto_capture_code() -> Optional[tuple[str, str]]:
             return qp["code"], qp["state"]
     except Exception:
         pass
-    # 2) API antiga (alguns workspaces ainda suportam)
+    # 2) API antiga (fallback)
     try:
         qp = normalize_qp(st.experimental_get_query_params())
         if qp.get("code") and qp.get("state"):
@@ -113,85 +112,86 @@ if captured:
                 st.query_params = {}
             st.rerun()
 
-# ============== UI: AUTORIZAÇÃO ==============
-st.title("📊 Dashboard de vendas – Bling (Tiburcio’s Stuff)")
+# ============== LAYOUT EM ABAS ==============
+tab_dash, tab_oauth = st.tabs(["📊 Dashboard", "🔐 Integração (OAuth)"])
 
-st.sidebar.header("Configurar conta (OAuth)")
-st.sidebar.caption(f"Redirect em uso: {APP_BASE}")
+# ---------------- OAuth TAB ----------------
+with tab_oauth:
+    st.header("Integração com o Bling (OAuth)")
+    st.caption(f"Redirect configurado: `{APP_BASE}`")
 
-# Em alguns navegadores, st.link_button pode ser bloqueado.
-# Usamos um link HTML explícito que abre em nova aba.
-auth_link = build_auth_link(TS_CLIENT_ID, "auth-ts")
-st.sidebar.markdown(
-    f'<a href="{auth_link}" target="_blank" rel="noopener" class="stButton">'
-    f'<button>Autorizar TS</button></a>',
-    unsafe_allow_html=True,
-)
+    # Link de autorização (abre em nova aba)
+    auth_link = build_auth_link(TS_CLIENT_ID, "auth-ts")
+    st.markdown(
+        f'<a href="{auth_link}" target="_blank" rel="noopener" class="stButton">'
+        f'<button>Autorizar TS</button></a>',
+        unsafe_allow_html=True,
+    )
 
-with st.sidebar.expander("Ver URL de autorização (debug)"):
-    st.code(auth_link, language="text")
+    with st.expander("Ver URL de autorização (debug)"):
+        st.code(auth_link, language="text")
 
-# Campo MANUAL sempre visível
-st.subheader("⚙️ Finalizar autorização (se necessário)")
-st.write(
-    "Se voltou do Bling com `?code=...&state=auth-ts` e o painel não atualizou, "
-    "cole abaixo **a URL completa** da barra do navegador **ou só o `code`** e clique **Trocar agora**."
-)
-manual = st.text_input(
-    "Cole a URL de retorno do Bling ou apenas o code",
-    placeholder="https://dashboard-ts.streamlit.app/?code=...&state=auth-ts  ou  e57518... ",
-)
-colA, colB = st.columns([1, 3])
-with colA:
-    if st.button("Trocar agora"):
-        code_value = None
-        raw = manual.strip()
-        if not raw:
-            st.error("Cole a URL ou o code.")
-        else:
-            if raw.startswith("http"):
-                try:
-                    qs = parse_qs(urlparse(raw).query)
-                    code_value = (qs.get("code") or [None])[0]
-                    state_value = (qs.get("state") or [None])[0]
-                    if state_value and state_value != "auth-ts":
-                        st.error("State diferente de auth-ts. Confira a URL de retorno.")
-                        code_value = None
-                except Exception as e:
-                    st.error(f"URL inválida: {e}")
+    st.subheader("Finalizar autorização (se necessário)")
+    st.write(
+        "Se voltou do Bling com `?code=...&state=auth-ts` e o painel não atualizou, "
+        "cole abaixo **a URL completa** da barra do navegador **ou só o `code`** e clique **Trocar agora**."
+    )
+    manual = st.text_input(
+        "Cole a URL de retorno do Bling ou apenas o code",
+        placeholder="https://dashboard-ts.streamlit.app/?code=...&state=auth-ts  ou  e57518... ",
+        key="manual_auth_input",
+    )
+    colA, colB = st.columns([1, 2])
+    with colA:
+        if st.button("Trocar agora", key="btn_manual_exchange"):
+            code_value = None
+            raw = manual.strip()
+            if not raw:
+                st.error("Cole a URL ou o code.")
             else:
-                code_value = raw
-
-            if code_value:
-                if code_value == st.session_state["_last_code_used"]:
-                    st.warning("Este code já foi usado. Gere um novo clicando em Autorizar TS.")
-                else:
-                    st.session_state["_last_code_used"] = code_value
+                if raw.startswith("http"):
                     try:
-                        tokens = exchange_code_for_tokens(code_value)
-                        st.session_state["ts_refresh"] = tokens.get("refresh_token")
-                        st.session_state["ts_access"]  = tokens.get("access_token")
-                        st.success("TS autorizado e refresh_token atualizado!")
-                        try:
-                            st.query_params.clear()
-                        except Exception:
-                            st.query_params = {}
-                        st.rerun()
+                        qs = parse_qs(urlparse(raw).query)
+                        code_value  = (qs.get("code") or [None])[0]
+                        state_value = (qs.get("state") or [None])[0]
+                        if state_value and state_value != "auth-ts":
+                            st.error("State diferente de auth-ts. Confira a URL de retorno.")
+                            code_value = None
                     except Exception as e:
-                        st.error(f"Falha na troca manual do code: {e}")
+                        st.error(f"URL inválida: {e}")
+                else:
+                    code_value = raw
 
-with colB:
-    with st.expander("Debug rápido da URL atual"):
-        try:
-            st.write("st.query_params →", dict(st.query_params.items()))
-        except Exception:
-            st.write("st.query_params indisponível")
-        try:
-            st.write("experimental_get_query_params →", st.experimental_get_query_params())
-        except Exception:
-            st.write("experimental_get_query_params indisponível")
+                if code_value:
+                    if code_value == st.session_state["_last_code_used"]:
+                        st.warning("Este code já foi usado. Gere um novo clicando em Autorizar TS.")
+                    else:
+                        st.session_state["_last_code_used"] = code_value
+                        try:
+                            tokens = exchange_code_for_tokens(code_value)
+                            st.session_state["ts_refresh"] = tokens.get("refresh_token")
+                            st.session_state["ts_access"]  = tokens.get("access_token")
+                            st.success("TS autorizado e refresh_token atualizado!")
+                            try:
+                                st.query_params.clear()
+                            except Exception:
+                                st.query_params = {}
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Falha na troca manual do code: {e}")
 
-# ============== FILTROS ==============
+    with colB:
+        with st.expander("Debug rápido da URL atual"):
+            try:
+                st.write("st.query_params →", dict(st.query_params.items()))
+            except Exception:
+                st.write("st.query_params indisponível")
+            try:
+                st.write("experimental_get_query_params →", st.experimental_get_query_params())
+            except Exception:
+                st.write("experimental_get_query_params indisponível")
+
+# ---------------- Sidebar de filtros (continua disponível em qualquer aba) ----------------
 st.sidebar.header("Filtros")
 DEFAULT_START = (dt.date.today() - relativedelta(months=1)).replace(day=1)
 DEFAULT_END   = dt.date.today()
@@ -209,7 +209,6 @@ def fetch_orders(refresh_token: str, date_start: dt.date, date_end: dt.date) -> 
     access, maybe_new_refresh = refresh_access_token(refresh_token)
     headers = {"Authorization": f"Bearer {access}"}
     params = {
-        # estes nomes funcionaram melhor em testes; ajuste se seu app usa variantes
         "dataInicial": date_start.strftime("%Y-%m-%d"),
         "dataFinal":   date_end.strftime("%Y-%m-%d"),
         "limite":      PAGE_LIMIT,
@@ -230,8 +229,7 @@ def fetch_orders(refresh_token: str, date_start: dt.date, date_end: dt.date) -> 
             break
         params["pagina"] += 1
 
-    # normalização simples
-    def g(d, key, default=None):  # get safe
+    def g(d, key, default=None):
         return d.get(key, default) if isinstance(d, dict) else default
     def gg(d, k1, k2, default=None):
         return g(g(d, k1, {}), k2, default)
@@ -252,47 +250,51 @@ def fetch_orders(refresh_token: str, date_start: dt.date, date_end: dt.date) -> 
         df["total"] = pd.to_numeric(df["total"], errors="coerce")
     return df, maybe_new_refresh
 
-# sem refresh -> pedir autorização
-if not st.session_state["ts_refresh"]:
-    with st.expander("Avisos/Erros de integração", expanded=True):
-        st.info("Autorize a conta **TS** (clique em **Autorizar TS** ou use o campo acima para colar a URL/code).")
-    st.stop()
+# ============== DASHBOARD TAB ==============
+with tab_dash:
+    st.title("📊 Dashboard de vendas – Bling (Tiburcio’s Stuff)")
 
-errors: List[str] = []
-try:
-    df, new_r = fetch_orders(st.session_state["ts_refresh"], date_start, date_end)
-    if new_r:
-        st.session_state["ts_refresh"] = new_r
-except Exception as e:
-    errors.append(f"Tiburcio's Stuff: {e}")
-    df = pd.DataFrame()
+    # Sem refresh? Mostra aviso e direciona o usuário à aba de OAuth.
+    if not st.session_state["ts_refresh"]:
+        with st.expander("Avisos/Erros de integração", expanded=True):
+            st.info("Autorize a conta **TS** na aba **‘🔐 Integração (OAuth)’** para carregar as vendas.")
+        st.stop()
 
-if errors:
-    with st.expander("Avisos/Erros de integração", expanded=True):
-        for e in errors:
-            st.warning(e)
+    errors: List[str] = []
+    try:
+        df, new_r = fetch_orders(st.session_state["ts_refresh"], date_start, date_end)
+        if new_r:
+            st.session_state["ts_refresh"] = new_r
+    except Exception as e:
+        errors.append(f"Tiburcio's Stuff: {e}")
+        df = pd.DataFrame()
 
-if df.empty:
-    st.info("Nenhum pedido encontrado para os filtros informados.")
-    st.stop()
+    if errors:
+        with st.expander("Avisos/Erros de integração", expanded=True):
+            for e in errors:
+                st.warning(e)
 
-# ============== KPIs E VISUALIZAÇÕES ==============
-col1, col2, col3 = st.columns(3)
-qtd     = int(df.shape[0])
-receita = float(df["total"].sum())
-ticket  = float(receita / qtd) if qtd else 0.0
-col1.metric("Pedidos", f"{qtd:,}".replace(",", "."))
-col2.metric("Receita", f"R$ {receita:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
-col3.metric("Ticket médio", f"R$ {ticket:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
+    if df.empty:
+        st.info("Nenhum pedido encontrado para os filtros informados.")
+        st.stop()
 
-st.subheader("Vendas por dia")
-by_day = df.assign(dia=df["data"].dt.date).groupby("dia", as_index=False)["total"].sum()
-st.line_chart(by_day.set_index("dia"))
+    # KPIs
+    col1, col2, col3 = st.columns(3)
+    qtd     = int(df.shape[0])
+    receita = float(df["total"].sum())
+    ticket  = float(receita / qtd) if qtd else 0.0
+    col1.metric("Pedidos", f"{qtd:,}".replace(",", "."))
+    col2.metric("Receita", f"R$ {receita:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
+    col3.metric("Ticket médio", f"R$ {ticket:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
 
-st.subheader("Receita por loja (ID)")
-by_loja = df.groupby("loja_id", as_index=False)["total"].sum().sort_values("total", ascending=False)
-if not by_loja.empty:
-    st.bar_chart(by_loja.set_index("loja_id"))
+    st.subheader("Vendas por dia")
+    by_day = df.assign(dia=df["data"].dt.date).groupby("dia", as_index=False)["total"].sum()
+    st.line_chart(by_day.set_index("dia"))
 
-st.subheader("Tabela de pedidos")
-st.dataframe(df.sort_values("data", ascending=False))
+    st.subheader("Receita por loja (ID)")
+    by_loja = df.groupby("loja_id", as_index=False)["total"].sum().sort_values("total", ascending=False)
+    if not by_loja.empty:
+        st.bar_chart(by_loja.set_index("loja_id"))
+
+    st.subheader("Tabela de pedidos")
+    st.dataframe(df.sort_values("data", ascending=False))
