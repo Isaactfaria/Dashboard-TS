@@ -2,25 +2,29 @@
 """
 Bling Dashboard – Tiburcio's Stuff (single store)
 -------------------------------------------------
-Captura robusta do ?code=:
-- tenta st.query_params
-- tenta experimental_get_query_params()
-- fallback: lê window.location.search e captura automaticamente
+- Client ID / Secret via Secrets
+- Botão "Autorizar TS" (vai ao Bling)
+- Captura ultra-robusta do ?code= (sem colar nada)
+- Guarda refresh_token em memória (session_state) e renova access_token
+- Sem campo "ID da Loja" (uma loja apenas)
 """
 
 from __future__ import annotations
 import datetime as dt
 from dateutil.relativedelta import relativedelta
 from typing import Optional, Tuple, List
-from urllib.parse import urlencode, parse_qs
+from urllib.parse import urlencode
 
 import pandas as pd
 import requests
 import streamlit as st
 
-# ============ CONFIG ============
-APP_BASE = st.secrets.get("APP_BASE", "https://dashboard-ts.streamlit.app")
-REDIRECT_URI = APP_BASE
+# =========================
+# CONFIG
+# =========================
+APP_BASE = st.secrets.get("APP_BASE", "https://dashboard-ts.streamlit.app")  # URL do seu app
+REDIRECT_URI = APP_BASE  # deve ser idêntico ao Link de redirecionamento no Bling
+
 TOKEN_URL  = "https://www.bling.com.br/Api/v3/oauth/token"
 AUTH_URL   = "https://www.bling.com.br/Api/v3/oauth/authorize"
 ORDERS_URL = "https://www.bling.com.br/Api/v3/pedidos/vendas"
@@ -28,19 +32,26 @@ DEFAULT_LIMIT = 100
 
 st.set_page_config(page_title="Dashboard de vendas – Bling (Tiburcio’s Stuff)", layout="wide")
 
-# ============ STATE ============
+# =========================
+# STATE
+# =========================
+# Se existir TS_REFRESH_TOKEN nos Secrets, já começamos com ele
 st.session_state.setdefault("ts_refresh", st.secrets.get("TS_REFRESH_TOKEN"))
 
-# ============ OAUTH HELPERS ============
+# =========================
+# HELPERS OAUTH
+# =========================
 def build_auth_link(client_id: str, state: str) -> str:
+    """Monta o link de autorização do Bling."""
     return AUTH_URL + "?" + urlencode({
         "response_type": "code",
         "client_id": client_id,
         "redirect_uri": REDIRECT_URI,
-        "state": state,
+        "state": state,  # 'auth-ts'
     })
 
 def exchange_code_for_tokens(client_id: str, client_secret: str, code: str) -> dict:
+    """Troca authorization code por tokens."""
     resp = requests.post(
         TOKEN_URL,
         auth=(client_id, client_secret),
@@ -52,6 +63,7 @@ def exchange_code_for_tokens(client_id: str, client_secret: str, code: str) -> d
     return resp.json()
 
 def refresh_access_token(client_id: str, client_secret: str, refresh_token: str) -> Tuple[str, Optional[str]]:
+    """Gera access_token com refresh_token. Retorna (access_token, refresh_token_novo_ou_None)."""
     resp = requests.post(
         TOKEN_URL,
         auth=(client_id, client_secret),
@@ -63,44 +75,43 @@ def refresh_access_token(client_id: str, client_secret: str, refresh_token: str)
     j = resp.json()
     return j.get("access_token", ""), j.get("refresh_token")
 
-# ============ CAPTURA DO CODE (logo no início) ============
+# =========================
+# CAPTURA DO CODE (logo no início da execução)
+# =========================
 def _normalize_qp_dict(qd) -> dict:
     out = {}
     for k, v in qd.items():
         out[k] = v[0] if isinstance(v, list) else v
     return out
 
-def try_capture_code() -> Optional[tuple[str, str]]:
-    # 1) st.query_params
+def capture_code_state() -> Optional[tuple[str, str]]:
+    # 1) st.query_params (Streamlit novo)
     try:
         qp = dict(st.query_params.items())
         qp = _normalize_qp_dict(qp)
         code = qp.get("code"); state = qp.get("state")
-        if code and state: return code, state
+        if code and state:
+            return code, state
     except Exception:
         pass
-    # 2) experimental_get_query_params
+    # 2) experimental_get_query_params (compat antigo)
     try:
         qp = st.experimental_get_query_params()
         qp = _normalize_qp_dict(qp)
         code = qp.get("code"); state = qp.get("state")
-        if code and state: return code, state
+        if code and state:
+            return code, state
     except Exception:
         pass
-    return None
-
-captured = try_capture_code()
-
-# Fallback JS: lê window.location.search e envia de volta
-if not captured:
+    # 3) fallback: usa campo oculto para receber window.location.search via JS
     st.html("""
     <script>
       (function(){
-        const params = new URLSearchParams(window.location.search);
-        const code = params.get('code'); const state = params.get('state');
+        const p = new URLSearchParams(window.location.search);
+        const code = p.get('code'); const state = p.get('state');
         if (code && state) {
-          const pyInput = window.parent.document.querySelector('input[data-testid="stTextInput"][aria-label="__oauth_code_state"]');
-          if (pyInput) { pyInput.value = code+"|"+state; pyInput.dispatchEvent(new Event('input', {bubbles: true})); }
+          const el = window.parent.document.querySelector('input[aria-label="__oauth_code_state"]');
+          if (el) { el.value = code + "|" + state; el.dispatchEvent(new Event('input', {bubbles:true})); }
         }
       })();
     </script>
@@ -108,9 +119,10 @@ if not captured:
     hidden = st.text_input("__oauth_code_state", key="__oauth_code_state", label_visibility="collapsed")
     if hidden and "|" in hidden:
         code, state = hidden.split("|", 1)
-        captured = (code, state)
+        return code, state
+    return None
 
-# Se capturou, trocar por tokens imediatamente
+captured = capture_code_state()
 if captured:
     code, state = captured
     if state == "auth-ts":
@@ -125,16 +137,19 @@ if captured:
         except Exception as e:
             st.error(f"Não foi possível autorizar TS: {e}")
         finally:
+            # limpa a query e recarrega
             try:
                 st.query_params.clear()
             except Exception:
                 st.query_params = {}
             st.rerun()
 
-# ============ UI PRINCIPAL ============
+# =========================
+# UI
+# =========================
 st.title("📊 Dashboard de vendas – Bling (Tiburcio’s Stuff)")
 
-# Sidebar – OAuth + Filtros
+# Sidebar – OAuth + Filtros (sem ID de loja)
 st.sidebar.header("Configurar conta (OAuth)")
 st.sidebar.caption(f"Redirect em uso: {REDIRECT_URI}")
 
@@ -147,7 +162,6 @@ except Exception:
 with st.sidebar.expander("Ver URL de autorização (debug)"):
     st.code(ts_url if "ts_url" in locals() else "—", language="text")
 
-# Filtros
 st.sidebar.header("Filtros")
 DEFAULT_START = (dt.date.today() - relativedelta(months=1)).replace(day=1)
 DEFAULT_END   = dt.date.today()
@@ -156,15 +170,15 @@ with c1:
     date_start = st.date_input("Data inicial", value=DEFAULT_START)
 with c2:
     date_end   = st.date_input("Data final",   value=DEFAULT_END)
-loja_id_str = st.sidebar.text_input("ID da Loja (opcional)")
-loja_id_val = int(loja_id_str) if loja_id_str.strip().isdigit() else None
-if st.sidebar.button("Atualizar dados"): st.cache_data.clear()
+if st.sidebar.button("Atualizar dados"):
+    st.cache_data.clear()
 
-# ============ DADOS ============
+# =========================
+# BUSCA DE VENDAS
+# =========================
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_orders(client_id: str, client_secret: str, refresh_token: str,
-                 date_start: dt.date, date_end: dt.date,
-                 loja_id: Optional[int] = None) -> Tuple[pd.DataFrame, Optional[str]]:
+                 date_start: dt.date, date_end: dt.date) -> Tuple[pd.DataFrame, Optional[str]]:
     access, maybe_new_refresh = refresh_access_token(client_id, client_secret, refresh_token)
     headers = {"Authorization": f"Bearer {access}"}
     params = {
@@ -173,8 +187,6 @@ def fetch_orders(client_id: str, client_secret: str, refresh_token: str,
         "limite":      DEFAULT_LIMIT,
         "pagina":      1,
     }
-    if loja_id is not None:
-        params["idLoja"] = loja_id
 
     all_rows: List[dict] = []
     while True:
@@ -183,14 +195,18 @@ def fetch_orders(client_id: str, client_secret: str, refresh_token: str,
             raise RuntimeError(f"Erro ao listar pedidos p{params['pagina']}: {r.status_code} – {r.text}")
         data = r.json()
         rows = data if isinstance(data, list) else data.get("data") or data.get("itens") or []
-        if not rows: break
+        if not rows:
+            break
         all_rows.extend(rows)
-        if len(rows) < DEFAULT_LIMIT: break
+        if len(rows) < DEFAULT_LIMIT:
+            break
         params["pagina"] += 1
 
+    # Normaliza
     def safe(d, *keys, default=None):
         cur = d
-        for k in keys: cur = None if cur is None else cur.get(k)
+        for k in keys:
+            cur = None if cur is None else cur.get(k)
         return default if cur is None else cur
 
     recs = []
@@ -209,7 +225,7 @@ def fetch_orders(client_id: str, client_secret: str, refresh_token: str,
         df["total"] = pd.to_numeric(df["total"], errors="coerce")
     return df, maybe_new_refresh
 
-# Sem refresh não chama API
+# Sem refresh não chamamos API
 if not st.session_state["ts_refresh"]:
     with st.expander("Avisos/Erros de integração", expanded=True):
         st.info("Autorize a conta **TS** para carregar as vendas (clique em **Autorizar TS**).")
@@ -219,7 +235,7 @@ errors: List[str] = []
 try:
     df, new_r = fetch_orders(
         st.secrets["TS_CLIENT_ID"], st.secrets["TS_CLIENT_SECRET"], st.session_state["ts_refresh"],
-        date_start, date_end, loja_id_val
+        date_start, date_end
     )
     if new_r:
         st.session_state["ts_refresh"] = new_r
@@ -235,7 +251,9 @@ if df.empty:
     st.info("Nenhum pedido encontrado para os filtros informados.")
     st.stop()
 
-# KPIs
+# =========================
+# KPIs e visualizações
+# =========================
 col1, col2, col3 = st.columns(3)
 qtd     = int(df.shape[0])
 receita = float(df["total"].sum())
@@ -244,7 +262,6 @@ col1.metric("Pedidos", f"{qtd:,}".replace(",", "."))
 col2.metric("Receita", f"R$ {receita:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
 col3.metric("Ticket médio", f"R$ {ticket:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
 
-# Gráficos
 st.subheader("Vendas por dia")
 by_day = df.assign(dia=df["data"].dt.date).groupby("dia", as_index=False)["total"].sum()
 st.line_chart(by_day.set_index("dia"))
