@@ -4,15 +4,18 @@ Bling Dashboard – Tiburcio's Stuff (single store)
 -------------------------------------------------
 - CLIENT_ID / CLIENT_SECRET via Secrets
 - Botão "Autorizar TS" (vai ao Bling)
-- Captura do ?code= por 3 caminhos:
-  1) st.query_params
-  2) experimental_get_query_params()
-  3) Campo SEMPRE visível para colar a URL de retorno OU só o code
+- Captura do ?code=:
+    1) st.query_params
+    2) experimental_get_query_params()
+    3) Campo manual SEMPRE visível (URL completa ou só o code)
+- Proteção contra reuso do mesmo code (_last_code_used)
+- Backoff para HTTP 429 (rate limit Cloudflare)
 - Guarda refresh_token em memória (session_state) e renova access_token
 - Sem campo "ID da Loja"
 """
 
 from __future__ import annotations
+import time
 import datetime as dt
 from dateutil.relativedelta import relativedelta
 from typing import Optional, Tuple, List
@@ -39,6 +42,7 @@ st.set_page_config(page_title="Dashboard de vendas – Bling (Tiburcio’s Stuff
 # STATE
 # =========================
 st.session_state.setdefault("ts_refresh", st.secrets.get("TS_REFRESH_TOKEN"))
+st.session_state.setdefault("_last_code_used", None)  # evita reutilizar o mesmo code
 
 # =========================
 # HELPERS OAUTH
@@ -51,27 +55,39 @@ def build_auth_link(client_id: str, state: str) -> str:
         "state": state,  # 'auth-ts'
     })
 
+def _post_with_backoff(url, auth, data, tries=3, base_sleep=3):
+    """POST com backoff simples para lidar com 429 (rate limit)."""
+    for i in range(tries):
+        r = requests.post(url, auth=auth, data=data, timeout=30)
+        if r.status_code == 429 and i < tries - 1:
+            time.sleep(base_sleep * (i + 1))  # 3s, 6s...
+            continue
+        return r
+    return r
+
 def exchange_code_for_tokens(client_id: str, client_secret: str, code: str) -> dict:
-    resp = requests.post(
+    r = _post_with_backoff(
         TOKEN_URL,
         auth=(client_id, client_secret),
         data={"grant_type": "authorization_code", "code": code, "redirect_uri": REDIRECT_URI},
-        timeout=30,
     )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Falha na troca de code: {resp.status_code} – {resp.text}")
-    return resp.json()
+    if r.status_code == 429:
+        raise RuntimeError("Rate limited pelo Bling (429). Aguarde alguns minutos e tente novamente.")
+    if r.status_code != 200:
+        raise RuntimeError(f"Falha na troca de code: {r.status_code} – {r.text}")
+    return r.json()
 
 def refresh_access_token(client_id: str, client_secret: str, refresh_token: str) -> Tuple[str, Optional[str]]:
-    resp = requests.post(
+    r = _post_with_backoff(
         TOKEN_URL,
         auth=(client_id, client_secret),
         data={"grant_type": "refresh_token", "refresh_token": refresh_token},
-        timeout=30,
     )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Falha no refresh token: {resp.status_code} – {resp.text}")
-    j = resp.json()
+    if r.status_code == 429:
+        raise RuntimeError("Rate limited pelo Bling (429) ao renovar token. Tente novamente em alguns minutos.")
+    if r.status_code != 200:
+        raise RuntimeError(f"Falha no refresh token: {r.status_code} – {r.text}")
+    j = r.json()
     return j.get("access_token", ""), j.get("refresh_token")
 
 # =========================
@@ -101,10 +117,11 @@ def try_capture_code_auto() -> Optional[tuple[str, str]]:
 
 captured = try_capture_code_auto()
 
-# Se capturou automaticamente, troca já
+# Se capturou automaticamente, troca já (com proteção contra reuso)
 if captured:
     code, state = captured
-    if state == "auth-ts":
+    if state == "auth-ts" and code and code != st.session_state["_last_code_used"]:
+        st.session_state["_last_code_used"] = code
         try:
             j = exchange_code_for_tokens(st.secrets["TS_CLIENT_ID"], st.secrets["TS_CLIENT_SECRET"], code)
             new_ref = j.get("refresh_token")
@@ -143,45 +160,54 @@ with st.sidebar.expander("Ver URL de autorização (debug)"):
 
 # Campo SEMPRE visível para colar a URL (ou code) — força a troca mesmo se auto falhar
 st.subheader("⚙️ Finalizar autorização (se necessário)")
-st.write("Se a página voltou com `?code=...&state=auth-ts` e o painel não atualizou, cole aqui **a URL completa** da barra do navegador **ou só o `code`** e clique em **Trocar agora**.")
+st.write("Se a página voltou com `?code=...&state=auth-ts` e o painel não atualizou, cole aqui **a URL completa** da barra do navegador **ou só o `code`** e clique **Trocar agora**.")
 
 manual = st.text_input(
-    "Cole a URL de retorno do Bling ou só o code",
+    "Cole a URL de retorno do Bling ou apenas o code",
     placeholder="https://dashboard-ts.streamlit.app/?code=...&state=auth-ts  ou  e57518... ",
 )
 colA, colB = st.columns([1,3])
 with colA:
     if st.button("Trocar agora"):
         code_value = None
-        if manual.strip().startswith("http"):
+        state_value = None
+        raw = manual.strip()
+
+        if raw.startswith("http"):
             try:
-                qs = parse_qs(urlparse(manual).query)
-                code_value = (qs.get("code") or [None])[0]
+                qs = parse_qs(urlparse(raw).query)
+                code_value = (qs.get("code")  or [None])[0]
                 state_value = (qs.get("state") or [None])[0]
-                if state_value != "auth-ts":
+                if state_value and state_value != "auth-ts":
                     st.error("State diferente de auth-ts. Confirme que é o link de retorno da autorização TS.")
             except Exception as e:
                 st.error(f"Não consegui ler a URL: {e}")
         else:
             # assume que o usuário colou só o code
-            code_value = manual.strip()
+            code_value = raw
 
         if code_value:
-            try:
-                j = exchange_code_for_tokens(st.secrets["TS_CLIENT_ID"], st.secrets["TS_CLIENT_SECRET"], code_value)
-                new_ref = j.get("refresh_token")
-                if new_ref:
-                    st.session_state["ts_refresh"] = new_ref
-                    st.success("TS autorizado e refresh_token atualizado!")
-                    try:
-                        st.query_params.clear()
-                    except Exception:
-                        st.query_params = {}
-                    st.rerun()
-                else:
-                    st.error("Não veio refresh_token na resposta do Bling.")
-            except Exception as e:
-                st.error(f"Falha na troca manual do code: {e}")
+            if code_value == st.session_state["_last_code_used"]:
+                st.warning("Este code já foi usado. Clique em Autorizar TS novamente para gerar um novo.")
+            else:
+                st.session_state["_last_code_used"] = code_value
+                try:
+                    j = exchange_code_for_tokens(st.secrets["TS_CLIENT_ID"], st.secrets["TS_CLIENT_SECRET"], code_value)
+                    new_ref = j.get("refresh_token")
+                    if new_ref:
+                        st.session_state["ts_refresh"] = new_ref
+                        st.success("TS autorizado e refresh_token atualizado!")
+                        try:
+                            st.query_params.clear()
+                        except Exception:
+                            st.query_params = {}
+                        st.rerun()
+                    else:
+                        st.error("Não veio refresh_token na resposta do Bling.")
+                except Exception as e:
+                    st.error(f"Falha na troca manual do code: {e}")
+        else:
+            st.error("Não encontrei o code na URL/entrada.")
 
 with colB:
     # Debug rápido: mostra o que o app está vendo nos query params
