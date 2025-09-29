@@ -3,16 +3,20 @@
 Bling Dashboard – Tiburcio's Stuff (single store)
 -------------------------------------------------
 - CLIENT_ID / CLIENT_SECRET via Secrets
-- (Opcional) TS_REFRESH_TOKEN via Secrets para iniciar sem autorizar
-- Botão "Autorizar TS" com captura automática do ?code= (state=auth-ts)
-- Auto-refresh do access_token; refresh novo mantém em memória
+- Botão "Autorizar TS" (vai ao Bling)
+- Captura do ?code= por 3 caminhos:
+  1) st.query_params
+  2) experimental_get_query_params()
+  3) Campo SEMPRE visível para colar a URL de retorno OU só o code
+- Guarda refresh_token em memória (session_state) e renova access_token
+- Sem campo "ID da Loja"
 """
 
 from __future__ import annotations
 import datetime as dt
 from dateutil.relativedelta import relativedelta
 from typing import Optional, Tuple, List
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse, parse_qs
 
 import pandas as pd
 import requests
@@ -21,26 +25,25 @@ import streamlit as st
 # =========================
 # CONFIG
 # =========================
-APP_BASE = st.secrets.get("APP_BASE", "https://dashboard-ts.streamlit.app")  # troque nos Secrets se seu domínio for outro
-REDIRECT_URI = APP_BASE  # precisa ser 100% igual ao cadastrado no Bling
+APP_BASE = st.secrets.get("APP_BASE", "https://dashboard-ts.streamlit.app")  # URL pública do app
+REDIRECT_URI = APP_BASE  # deve ser idêntico ao Link de redirecionamento no Bling
 
 TOKEN_URL  = "https://www.bling.com.br/Api/v3/oauth/token"
 AUTH_URL   = "https://www.bling.com.br/Api/v3/oauth/authorize"
 ORDERS_URL = "https://www.bling.com.br/Api/v3/pedidos/vendas"
 DEFAULT_LIMIT = 100
 
-st.set_page_config(page_title="Dashboard de vendas – Bling (TS)", layout="wide")
-st.title("📊 Dashboard de vendas – Bling (Tiburcio’s Stuff)")
+st.set_page_config(page_title="Dashboard de vendas – Bling (Tiburcio’s Stuff)", layout="wide")
 
 # =========================
-# STATE (refresh em memória)
+# STATE
 # =========================
-st.session_state.setdefault("ts_refresh", st.secrets.get("TS_REFRESH_TOKEN"))  # se existir nos Secrets, já começa usando
+st.session_state.setdefault("ts_refresh", st.secrets.get("TS_REFRESH_TOKEN"))
 
 # =========================
-# OAuth helpers
+# HELPERS OAUTH
 # =========================
-def auth_link(client_id: str, state: str) -> str:
+def build_auth_link(client_id: str, state: str) -> str:
     return AUTH_URL + "?" + urlencode({
         "response_type": "code",
         "client_id": client_id,
@@ -49,35 +52,166 @@ def auth_link(client_id: str, state: str) -> str:
     })
 
 def exchange_code_for_tokens(client_id: str, client_secret: str, code: str) -> dict:
-    r = requests.post(
+    resp = requests.post(
         TOKEN_URL,
         auth=(client_id, client_secret),
         data={"grant_type": "authorization_code", "code": code, "redirect_uri": REDIRECT_URI},
         timeout=30,
     )
-    if r.status_code != 200:
-        raise RuntimeError(f"Falha na troca de code: {r.status_code} – {r.text}")
-    return r.json()
+    if resp.status_code != 200:
+        raise RuntimeError(f"Falha na troca de code: {resp.status_code} – {resp.text}")
+    return resp.json()
 
 def refresh_access_token(client_id: str, client_secret: str, refresh_token: str) -> Tuple[str, Optional[str]]:
-    r = requests.post(
+    resp = requests.post(
         TOKEN_URL,
         auth=(client_id, client_secret),
         data={"grant_type": "refresh_token", "refresh_token": refresh_token},
         timeout=30,
     )
-    if r.status_code != 200:
-        raise RuntimeError(f"Falha no refresh token: {r.status_code} – {r.text}")
-    j = r.json()
+    if resp.status_code != 200:
+        raise RuntimeError(f"Falha no refresh token: {resp.status_code} – {resp.text}")
+    j = resp.json()
     return j.get("access_token", ""), j.get("refresh_token")
 
 # =========================
-# Dados
+# CAPTURA AUTOMÁTICA DO CODE (2 jeitos)
+# =========================
+def normalize_qp(d: dict) -> dict:
+    return {k: (v[0] if isinstance(v, list) else v) for k, v in d.items()}
+
+def try_capture_code_auto() -> Optional[tuple[str, str]]:
+    # 1) query_params (novo)
+    try:
+        qp = normalize_qp(dict(st.query_params.items()))
+        code, state = qp.get("code"), qp.get("state")
+        if code and state:
+            return code, state
+    except Exception:
+        pass
+    # 2) experimental_ (antigo)
+    try:
+        qp = normalize_qp(st.experimental_get_query_params())
+        code, state = qp.get("code"), qp.get("state")
+        if code and state:
+            return code, state
+    except Exception:
+        pass
+    return None
+
+captured = try_capture_code_auto()
+
+# Se capturou automaticamente, troca já
+if captured:
+    code, state = captured
+    if state == "auth-ts":
+        try:
+            j = exchange_code_for_tokens(st.secrets["TS_CLIENT_ID"], st.secrets["TS_CLIENT_SECRET"], code)
+            new_ref = j.get("refresh_token")
+            if new_ref:
+                st.session_state["ts_refresh"] = new_ref
+                st.success("TS autorizado e refresh_token atualizado!")
+            else:
+                st.error("Não veio refresh_token na resposta do Bling.")
+        except Exception as e:
+            st.error(f"Não foi possível autorizar TS: {e}")
+        finally:
+            try:
+                st.query_params.clear()
+            except Exception:
+                st.query_params = {}
+            st.rerun()
+
+# =========================
+# UI
+# =========================
+st.title("📊 Dashboard de vendas – Bling (Tiburcio’s Stuff)")
+
+# Sidebar – OAuth + Filtros (sem ID de loja)
+st.sidebar.header("Configurar conta (OAuth)")
+st.sidebar.caption(f"Redirect em uso: {REDIRECT_URI}")
+
+# Botão para abrir o consent do Bling
+try:
+    ts_url = build_auth_link(st.secrets["TS_CLIENT_ID"], "auth-ts")
+    st.sidebar.link_button("Autorizar TS", ts_url)
+except Exception:
+    st.sidebar.error("Preencha TS_CLIENT_ID e TS_CLIENT_SECRET nos Secrets.")
+
+with st.sidebar.expander("Ver URL de autorização (debug)"):
+    st.code(ts_url if "ts_url" in locals() else "—", language="text")
+
+# Campo SEMPRE visível para colar a URL (ou code) — força a troca mesmo se auto falhar
+st.subheader("⚙️ Finalizar autorização (se necessário)")
+st.write("Se a página voltou com `?code=...&state=auth-ts` e o painel não atualizou, cole aqui **a URL completa** da barra do navegador **ou só o `code`** e clique em **Trocar agora**.")
+
+manual = st.text_input(
+    "Cole a URL de retorno do Bling ou só o code",
+    placeholder="https://dashboard-ts.streamlit.app/?code=...&state=auth-ts  ou  e57518... ",
+)
+colA, colB = st.columns([1,3])
+with colA:
+    if st.button("Trocar agora"):
+        code_value = None
+        if manual.strip().startswith("http"):
+            try:
+                qs = parse_qs(urlparse(manual).query)
+                code_value = (qs.get("code") or [None])[0]
+                state_value = (qs.get("state") or [None])[0]
+                if state_value != "auth-ts":
+                    st.error("State diferente de auth-ts. Confirme que é o link de retorno da autorização TS.")
+            except Exception as e:
+                st.error(f"Não consegui ler a URL: {e}")
+        else:
+            # assume que o usuário colou só o code
+            code_value = manual.strip()
+
+        if code_value:
+            try:
+                j = exchange_code_for_tokens(st.secrets["TS_CLIENT_ID"], st.secrets["TS_CLIENT_SECRET"], code_value)
+                new_ref = j.get("refresh_token")
+                if new_ref:
+                    st.session_state["ts_refresh"] = new_ref
+                    st.success("TS autorizado e refresh_token atualizado!")
+                    try:
+                        st.query_params.clear()
+                    except Exception:
+                        st.query_params = {}
+                    st.rerun()
+                else:
+                    st.error("Não veio refresh_token na resposta do Bling.")
+            except Exception as e:
+                st.error(f"Falha na troca manual do code: {e}")
+
+with colB:
+    # Debug rápido: mostra o que o app está vendo nos query params
+    with st.expander("Debug rápido dos parâmetros da URL"):
+        try:
+            st.write("st.query_params →", dict(st.query_params.items()))
+        except Exception:
+            st.write("st.query_params indisponível")
+        try:
+            st.write("experimental_get_query_params →", st.experimental_get_query_params())
+        except Exception:
+            st.write("experimental_get_query_params indisponível")
+
+st.sidebar.header("Filtros")
+DEFAULT_START = (dt.date.today() - relativedelta(months=1)).replace(day=1)
+DEFAULT_END   = dt.date.today()
+c1, c2 = st.sidebar.columns(2)
+with c1:
+    date_start = st.date_input("Data inicial", value=DEFAULT_START)
+with c2:
+    date_end   = st.date_input("Data final",   value=DEFAULT_END)
+if st.sidebar.button("Atualizar dados"):
+    st.cache_data.clear()
+
+# =========================
+# BUSCA DE VENDAS
 # =========================
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_orders(client_id: str, client_secret: str, refresh_token: str,
-                 date_start: dt.date, date_end: dt.date,
-                 loja_id: Optional[int] = None) -> Tuple[pd.DataFrame, Optional[str]]:
+                 date_start: dt.date, date_end: dt.date) -> Tuple[pd.DataFrame, Optional[str]]:
     access, maybe_new_refresh = refresh_access_token(client_id, client_secret, refresh_token)
     headers = {"Authorization": f"Bearer {access}"}
     params = {
@@ -86,8 +220,6 @@ def fetch_orders(client_id: str, client_secret: str, refresh_token: str,
         "limite":      DEFAULT_LIMIT,
         "pagina":      1,
     }
-    if loja_id is not None:
-        params["idLoja"] = loja_id
 
     all_rows: List[dict] = []
     while True:
@@ -103,6 +235,7 @@ def fetch_orders(client_id: str, client_secret: str, refresh_token: str,
             break
         params["pagina"] += 1
 
+    # Normaliza
     def safe(d, *keys, default=None):
         cur = d
         for k in keys:
@@ -125,78 +258,20 @@ def fetch_orders(client_id: str, client_secret: str, refresh_token: str,
         df["total"] = pd.to_numeric(df["total"], errors="coerce")
     return df, maybe_new_refresh
 
-# =========================
-# Sidebar – OAuth + Filtros
-# =========================
-st.sidebar.header("Configurar conta (OAuth)")
-st.sidebar.caption(f"Redirect em uso: {REDIRECT_URI}")
-
-# Botão de autorizar
-try:
-    ts_url = auth_link(st.secrets["TS_CLIENT_ID"], "auth-ts")
-    st.sidebar.link_button("Autorizar TS", ts_url)
-except Exception:
-    st.sidebar.error("Preencha TS_CLIENT_ID e TS_CLIENT_SECRET nos Secrets.")
-
-# Debug (opcional)
-with st.sidebar.expander("Ver URL de autorização (debug)"):
-    st.code(ts_url if "ts_url" in locals() else "—", language="text")
-
-# Captura automática do retorno (?code=) – compatível com valores em lista
-qp = st.query_params
-code  = qp.get("code")
-state = qp.get("state")
-if isinstance(code, list):  code  = code[0] if code else None
-if isinstance(state, list): state = state[0] if state else None
-
-if code and state == "auth-ts":
-    try:
-        j = exchange_code_for_tokens(st.secrets["TS_CLIENT_ID"], st.secrets["TS_CLIENT_SECRET"], code)
-        new_ref = j.get("refresh_token")
-        if new_ref:
-            st.session_state["ts_refresh"] = new_ref
-            st.success("TS autorizado e refresh_token atualizado!")
-        else:
-            st.error("Não veio refresh_token na resposta do Bling.")
-    except Exception as e:
-        st.error(f"Não foi possível autorizar TS: {e}")
-    finally:
-        # limpa a query e recarrega
-        st.query_params = {}
-        st.rerun()
-
-# Filtros
-st.sidebar.header("Filtros")
-DEFAULT_START = (dt.date.today() - relativedelta(months=1)).replace(day=1)
-DEFAULT_END   = dt.date.today()
-c1, c2 = st.sidebar.columns(2)
-with c1:
-    date_start = st.date_input("Data inicial", value=DEFAULT_START)
-with c2:
-    date_end   = st.date_input("Data final",   value=DEFAULT_END)
-loja_id_str = st.sidebar.text_input("ID da Loja (opcional)")
-loja_id_val = int(loja_id_str) if loja_id_str.strip().isdigit() else None
-if st.sidebar.button("Atualizar dados"): st.cache_data.clear()
-
-# =========================
-# Carregamento (só se tiver refresh)
-# =========================
+# Sem refresh não chamamos API
 if not st.session_state["ts_refresh"]:
     with st.expander("Avisos/Erros de integração", expanded=True):
-        st.info("Autorize a conta **TS** para carregar as vendas (clique em **Autorizar TS**).")
+        st.info("Autorize a conta **TS** (clique em **Autorizar TS** ou use o campo acima para colar a URL/code).")
     st.stop()
 
 errors: List[str] = []
-dfs: List[pd.DataFrame] = []
-
 try:
-    df_ts, new_r = fetch_orders(
+    df, new_r = fetch_orders(
         st.secrets["TS_CLIENT_ID"], st.secrets["TS_CLIENT_SECRET"], st.session_state["ts_refresh"],
-        date_start, date_end, loja_id_val
+        date_start, date_end
     )
     if new_r:
         st.session_state["ts_refresh"] = new_r
-    df = df_ts
 except Exception as e:
     errors.append(f"Tiburcio's Stuff: {e}")
     df = pd.DataFrame()
