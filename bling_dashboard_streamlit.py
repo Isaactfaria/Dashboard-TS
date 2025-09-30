@@ -236,6 +236,92 @@ def fetch_orders(refresh_token: str, date_start: dt.date, date_end: dt.date) -> 
         df["total"] = pd.to_numeric(df["total"], errors="coerce")
     return df, maybe_new_refresh
 
+# ====== 1.b) BORDERÔS (CONFIRMADOS) – fallback entre extratos e R/P ======
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_bordero_confirmed(refresh_token: str, date_start: dt.date, date_end: dt.date) -> Tuple[pd.DataFrame, Optional[str]]:
+    """
+    Recupera borderôs confirmados como alternativa aos extratos, tentando
+    múltiplas rotas e nomes de parâmetros comuns no Bling.
+    """
+    access, maybe_new_refresh = refresh_access_token(refresh_token)
+    headers = {"Authorization": f"Bearer {access}"}
+
+    candidates = [
+        ("https://www.bling.com.br/Api/v3/financeiro/borderos", ("dataInicial", "dataFinal")),
+        ("https://www.bling.com.br/Api/v3/financeiro/borderos", ("dataCriacaoInicial", "dataCriacaoFinal")),
+        ("https://www.bling.com.br/Api/v3/financeiro/borderos", ("dataLiquidacaoInicial", "dataLiquidacaoFinal")),
+        ("https://www.bling.com.br/Api/v3/financeiro/borderos", ("dataBaixaInicial", "dataBaixaFinal")),
+        ("https://www.bling.com.br/Api/v3/caixas/borderos", ("dataInicial", "dataFinal")),
+        ("https://www.bling.com.br/Api/v3/contas/borderos", ("dataInicial", "dataFinal")),
+        ("https://www.bling.com.br/Api/v3/borderos", ("dataInicial", "dataFinal")),
+    ]
+
+    last_err = None
+    rows: List[dict] = []
+    for url, (p_ini, p_fim) in candidates:
+        try:
+            params = {
+                p_ini: date_start.strftime("%Y-%m-%d"),
+                p_fim: date_end.strftime("%Y-%m-%d"),
+                # quando disponível, priorizar confirmados/liquidados
+                "apenasConfirmados": "true",
+            }
+            rows = _get_paginated_generic(url, headers, params)
+            if rows:
+                try:
+                    st.session_state["_fin_source_detail"] = f"{url} {p_ini},{p_fim} rows={len(rows)}"
+                except Exception:
+                    pass
+                break
+        except Exception as e:
+            last_err = e
+            rows = []
+
+    if rows == [] and last_err:
+        raise RuntimeError(f"Borderôs não disponíveis: {last_err}")
+
+    def g(d, k, default=None):
+        return d.get(k, default) if isinstance(d, dict) else default
+
+    def pick_date(d):
+        return (
+            g(d, "data")
+            or g(d, "dataCriacao")
+            or g(d, "dataLiquidacao")
+            or g(d, "dataBaixa")
+        )
+
+    def pick_amount(d):
+        # tenta campos comuns de valor
+        valor = (
+            g(d, "valorLiquido")
+            or g(d, "valorTotal")
+            or g(d, "valor")
+        )
+        v = float(pd.to_numeric(valor, errors="coerce") or 0)
+        tipo = (g(d, "tipo") or g(d, "natureza") or g(d, "operacao") or "").upper()
+        # Heurística para sinal: recebimentos positivos, pagamentos negativos
+        if "RECEB" in tipo or "ENTR" in tipo or tipo.startswith("C"):
+            return abs(v)
+        if "PAG" in tipo or "SAID" in tipo or tipo.startswith("D"):
+            return -abs(v)
+        # sem pista: assume positivo
+        return v
+
+    df = pd.DataFrame([
+        {
+            "data": pick_date(x),
+            "descricao": g(x, "descricao") or g(x, "observacao") or g(x, "historico"),
+            "valor": pick_amount(x),
+        }
+        for x in rows
+    ])
+
+    if not df.empty:
+        df["data"] = pd.to_datetime(df["data"], errors="coerce")
+        df = df.dropna(subset=["data"])
+    return df, maybe_new_refresh
+
 # ====== 1) EXTRATOS / CAIXAS & BANCOS (CONFIRMADOS) ======
 def _get_paginated_generic(url: str, headers: dict, params: dict) -> List[dict]:
     out: List[dict] = []
@@ -428,7 +514,7 @@ with tab_dash:
         errors.append(f"Vendas: {e}")
         df_vendas = pd.DataFrame()
 
-    # --- FINANCEIRO: preferir extratos confirmados; fallback receber/pagar pagos
+    # --- FINANCEIRO: preferir extratos confirmados; depois borderôs; fallback receber/pagar pagos
     origem_fin = "Indisponível"
     df_mov = pd.DataFrame(columns=["data", "descricao", "valor"])
     try:
@@ -437,19 +523,32 @@ with tab_dash:
         if new_r2:
             st.session_state["ts_refresh"] = new_r2
     except Exception as e:
+        # tenta borderôs antes do fallback R/P
         try:
-            df_mov, new_r3 = fetch_cashflow_fallback(st.session_state["ts_refresh"], date_start, date_end)
-            origem_fin = "Receber/Pagar pagos (fallback)"
-            if new_r3:
-                st.session_state["ts_refresh"] = new_r3
-        except Exception as e2:
-            errors.append(f"Financeiro: {e}\nFallback: {e2}")
-            # mantém df_mov vazio e origem_fin = "Indisponível"
+            df_mov, new_r_bordero = fetch_bordero_confirmed(st.session_state["ts_refresh"], date_start, date_end)
+            origem_fin = "Borderôs (confirmados)"
+            if new_r_bordero:
+                st.session_state["ts_refresh"] = new_r_bordero
+        except Exception as e_bordero:
+            try:
+                df_mov, new_r3 = fetch_cashflow_fallback(st.session_state["ts_refresh"], date_start, date_end)
+                origem_fin = "Receber/Pagar pagos (fallback)"
+                if new_r3:
+                    st.session_state["ts_refresh"] = new_r3
+            except Exception as e2:
+                errors.append(f"Financeiro: {e}\nBorderôs: {e_bordero}\nFallback: {e2}")
+                # mantém df_mov vazio e origem_fin = "Indisponível"
 
     if errors:
         with st.expander("Avisos/Erros de integração", expanded=True):
             for e in errors:
                 st.warning(e)
+            try:
+                detail = st.session_state.get("_fin_source_detail")
+                if detail:
+                    st.info(f"Fonte financeira utilizada: {detail}")
+            except Exception:
+                pass
 
     # ===== Sub-abas: Vendas primeiro, Financeiro depois
     sub_sales, sub_fin = st.tabs(["🛒 Vendas", "📈 Financeiro (DRE mensal)"])
