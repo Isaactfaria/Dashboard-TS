@@ -549,6 +549,13 @@ with tab_dash:
                     st.info(f"Fonte financeira utilizada: {detail}")
             except Exception:
                 pass
+            # Dica específica para erro de refresh token inválido
+            try:
+                all_err = "\n".join(errors)
+                if "invalid_grant" in all_err or "Invalid refresh token" in all_err:
+                    st.info("Seu refresh token está inválido/expirado. Vá na aba '🔐 Integração (OAuth)' e clique em 'Autorizar TS' para gerar um novo.")
+            except Exception:
+                pass
 
     # ===== Sub-abas: Vendas primeiro, Financeiro depois
     sub_sales, sub_fin = st.tabs(["🛒 Vendas", "📈 Financeiro (DRE mensal)"])
@@ -625,6 +632,22 @@ with tab_dash:
             for c in ["entradas", "pagos", "diferenca", "acumulado"]:
                 show[c] = show[c].map(lambda v: f"R$ {v:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
             st.dataframe(show, use_container_width=True)
+
+            # Seção de validação: duas colunas com Entradas e Saídas do período
+            st.subheader("Validação por período: Entradas x Saídas")
+            colE, colS = st.columns(2)
+            entradas_df = tmp[tmp["valor"] > 0].copy()
+            saidas_df   = tmp[tmp["valor"] < 0].copy()
+            total_entradas = float(pd.to_numeric(entradas_df["valor"], errors="coerce").sum()) if not entradas_df.empty else 0.0
+            total_saidas   = float(pd.to_numeric(saidas_df["valor"], errors="coerce").sum()) if not saidas_df.empty else 0.0
+            with colE:
+                st.markdown(f"**Entradas no período** — Total: {('R$ ' + format(total_entradas, ',.2f')).replace(',', '#').replace('.', ',').replace('#', '.')} ")
+                show_e = entradas_df.sort_values("data", ascending=False)[["data", "descricao", "valor"]]
+                st.dataframe(show_e, use_container_width=True)
+            with colS:
+                st.markdown(f"**Saídas no período** — Total: {('R$ ' + format(abs(total_saidas), ',.2f')).replace(',', '#').replace('.', ',').replace('#', '.')} ")
+                show_s = saidas_df.sort_values("data", ascending=False)[["data", "descricao", "valor"]]
+                st.dataframe(show_s, use_container_width=True)
 
             with st.expander("Detalhe – Movimentos (financeiro)"):
                 st.dataframe(df_mov.sort_values("data", ascending=False), use_container_width=True)
