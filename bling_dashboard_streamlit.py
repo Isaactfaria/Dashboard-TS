@@ -613,20 +613,29 @@ with tab_dash:
             dre["diferenca"] = dre["entradas"] - dre["pagos"]
             dre["acumulado"] = dre["diferenca"].cumsum()
 
-            total_in  = float(dre["entradas"].sum()) if not dre.empty else 0.0
-            total_pay = float(dre["pagos"].sum()) if not dre.empty else 0.0
-            diff      = total_in - total_pay
-            colA, colB, colC = st.columns(3)
-            colA.metric("Entrou no período", f"R$ {total_in:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
-            colB.metric("Pago no período",   f"R$ {total_pay:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
-            colC.metric("Diferença",         f"R$ {diff:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
+            # Totais do período
+            total_recebido = float(dre["entradas"].sum()) if not dre.empty else 0.0
+            total_pago     = float(dre["pagos"].sum()) if not dre.empty else 0.0
+            diff           = total_recebido - total_pago
 
+            # Duas colunas no topo (Pago à esquerda / Recebido à direita)
+            c_pag, c_rec = st.columns(2)
+            c_pag.metric("Pago no período",      f"R$ {total_pago:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
+            c_rec.metric("Recebido no período", f"R$ {total_recebido:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
+
+            # KPIs adicionais (mantém resumo)
+            colA, colB, colC = st.columns(3)
+            colA.metric("Receitas (confirmadas)", f"R$ {total_recebido:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
+            colB.metric("Despesas (confirmadas)", f"R$ {total_pago:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
+            colC.metric("Resultado do período",   f"R$ {diff:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
+
+            # Gráfico: barras (Entradas x Pagos) + linha (Diferença)
             base = alt.Chart(dre).encode(x=alt.X("mes:T", title="Mês"))
             bars = alt.layer(
-                base.mark_bar().encode(y=alt.Y("entradas:Q", title="Valor"), color=alt.value("#4CAF50")),
-                base.mark_bar().encode(y="pagos:Q", color=alt.value("#E53935"))
+                base.mark_bar().encode(y=alt.Y("entradas:Q", title="Valor")),
+                base.mark_bar().encode(y="pagos:Q")
             )
-            line = base.mark_line(point=True).encode(y="diferenca:Q", color=alt.value("#1E88E5"))
+            line = base.mark_line(point=True).encode(y="diferenca:Q")
             st.altair_chart(bars + line, use_container_width=True)
 
             st.subheader("Tabela DRE mensal")
@@ -635,21 +644,29 @@ with tab_dash:
                 show[c] = show[c].map(lambda v: f"R$ {v:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
             st.dataframe(show, use_container_width=True)
 
-            # Seção de validação: duas colunas com Entradas e Saídas do período
-            st.subheader("Validação por período: Entradas x Saídas")
-            colE, colS = st.columns(2)
+            # Detalhe do período (Paguei à esquerda, Recebi à direita)
+            st.subheader("Detalhe do período")
+            colP, colR = st.columns(2)
+
             entradas_df = tmp[tmp["valor"] > 0].copy()
             saidas_df   = tmp[tmp["valor"] < 0].copy()
             total_entradas = float(pd.to_numeric(entradas_df["valor"], errors="coerce").sum()) if not entradas_df.empty else 0.0
             total_saidas   = float(pd.to_numeric(saidas_df["valor"], errors="coerce").sum()) if not saidas_df.empty else 0.0
-            with colE:
-                st.markdown(f"**Entradas no período** — Total: {('R$ ' + format(total_entradas, ',.2f')).replace(',', '#').replace('.', ',').replace('#', '.')} ")
-                show_e = entradas_df.sort_values("data", ascending=False)[["data", "descricao", "valor"]]
-                st.dataframe(show_e, use_container_width=True)
-            with colS:
-                st.markdown(f"**Saídas no período** — Total: {('R$ ' + format(abs(total_saidas), ',.2f')).replace(',', '#').replace('.', ',').replace('#', '.')} ")
-                show_s = saidas_df.sort_values("data", ascending=False)[["data", "descricao", "valor"]]
+
+            with colP:
+                st.markdown(
+                    f"**Pagos no período** — Total: {('R$ ' + format(abs(total_saidas), ',.2f')).replace(',', '#').replace('.', ',').replace('#', '.')}"
+                )
+                show_s = saidas_df.sort_values("data", ascending=False)[["data", "descricao", "valor"]].copy()
+                show_s["valor"] = show_s["valor"].abs()
                 st.dataframe(show_s, use_container_width=True)
 
-            with st.expander("Detalhe – Movimentos (financeiro)"):
+            with colR:
+                st.markdown(
+                    f"**Recebidos no período** — Total: {('R$ ' + format(total_entradas, ',.2f')).replace(',', '#').replace('.', ',').replace('#', '.')}"
+                )
+                show_e = entradas_df.sort_values("data", ascending=False)[["data", "descricao", "valor"]]
+                st.dataframe(show_e, use_container_width=True)
+
+            with st.expander("Movimentos brutos (sinais originais)"):
                 st.dataframe(df_mov.sort_values("data", ascending=False), use_container_width=True)
