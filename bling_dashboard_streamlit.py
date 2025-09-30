@@ -13,7 +13,7 @@ import requests
 import streamlit as st
 import altair as alt
 
-# ============== CONFIG ==============
+# ================== CONFIG ==================
 APP_BASE         = st.secrets.get("APP_BASE", "https://dashboard-ts.streamlit.app")
 TS_CLIENT_ID     = st.secrets["TS_CLIENT_ID"]
 TS_CLIENT_SECRET = st.secrets["TS_CLIENT_SECRET"]
@@ -24,7 +24,7 @@ TOKEN_URL  = "https://www.bling.com.br/Api/v3/oauth/token"
 # Pedidos (para KPIs de vendas)
 ORDERS_URL = "https://www.bling.com.br/Api/v3/pedidos/vendas"
 
-# Receber/Pagar (fallback para DRE caso extrato bancário não esteja disponível)
+# Receber/Pagar (fallback para DRE, se extratos não estiverem disponíveis)
 RECEBER_URL = "https://www.bling.com.br/Api/v3/contas/receber"
 PAGAR_URL   = "https://www.bling.com.br/Api/v3/contas/pagar"
 
@@ -32,12 +32,12 @@ PAGE_LIMIT  = 100
 
 st.set_page_config(page_title="Dashboard de vendas – Bling (Tiburcio’s Stuff)", layout="wide")
 
-# ============== STATE ==============
+# ================== STATE ==================
 st.session_state.setdefault("ts_refresh", st.secrets.get("TS_REFRESH_TOKEN"))
 st.session_state.setdefault("ts_access", None)
 st.session_state.setdefault("_last_code_used", None)
 
-# ============== OAUTH HELPERS ==============
+# ================== OAUTH HELPERS ==================
 def build_auth_link(client_id: str, state: str) -> str:
     return AUTH_URL + "?" + urlencode({
         "response_type": "code",
@@ -80,17 +80,19 @@ def refresh_access_token(refresh_token: str) -> Tuple[str, Optional[str]]:
     j = r.json()
     return j.get("access_token", ""), j.get("refresh_token")
 
-# ============== CAPTURA AUTOMÁTICA DO ?code= (antes de desenhar as abas) ==============
+# ================== CAPTURA AUTOMÁTICA DO ?code= ==================
 def normalize_qp(d: dict) -> dict:
     return {k: (v[0] if isinstance(v, list) else v) for k, v in d.items()}
 
 def auto_capture_code() -> Optional[tuple[str, str]]:
+    # st.query_params (>=1.33)
     try:
         qp = normalize_qp(dict(st.query_params.items()))
         if qp.get("code") and qp.get("state"):
             return qp["code"], qp["state"]
     except Exception:
         pass
+    # compatibilidade: experimental_get_query_params
     try:
         qp = normalize_qp(st.experimental_get_query_params())
         if qp.get("code") and qp.get("state"):
@@ -118,7 +120,7 @@ if captured:
                 st.query_params = {}
             st.rerun()
 
-# ============== LAYOUT EM ABAS (reordenado) ==============
+# ================== LAYOUT EM ABAS ==================
 tab_dash, tab_oauth = st.tabs(["📊 Dashboard", "🔐 Integração (OAuth)"])
 
 # ---------------- OAuth TAB ----------------
@@ -132,6 +134,7 @@ with tab_oauth:
         f'<button>Autorizar TS</button></a>',
         unsafe_allow_html=True,
     )
+
     with st.expander("Ver URL de autorização (debug)"):
         st.code(auth_link, language="text")
 
@@ -187,7 +190,7 @@ with c2:
 if st.sidebar.button("Atualizar dados"):
     st.cache_data.clear()
 
-# ============== BUSCAS ==============
+# ================== BUSCAS ==================
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_orders(refresh_token: str, date_start: dt.date, date_end: dt.date) -> Tuple[pd.DataFrame, Optional[str]]:
     access, maybe_new_refresh = refresh_access_token(refresh_token)
@@ -212,7 +215,7 @@ def fetch_orders(refresh_token: str, date_start: dt.date, date_end: dt.date) -> 
             break
         params["pagina"] += 1
 
-    def g(d, key, default=None):  # get safe
+    def g(d, key, default=None):
         return d.get(key, default) if isinstance(d, dict) else default
     def gg(d, k1, k2, default=None):
         return g(g(d, k1, {}), k2, default)
@@ -263,7 +266,6 @@ def fetch_bank_confirmed(refresh_token: str, date_start: dt.date, date_end: dt.d
     access, maybe_new_refresh = refresh_access_token(refresh_token)
     headers = {"Authorization": f"Bearer {access}"}
 
-    # Tentativas: (endpoint, (param_ini, param_fim))
     candidates = [
         ("https://www.bling.com.br/Api/v3/financeiro/extratos", ("dataInicial", "dataFinal")),
         ("https://www.bling.com.br/Api/v3/financeiro/extratos", ("dataMovimentoInicial", "dataMovimentoFinal")),
@@ -279,8 +281,6 @@ def fetch_bank_confirmed(refresh_token: str, date_start: dt.date, date_end: dt.d
             params = {
                 p_ini: date_start.strftime("%Y-%m-%d"),
                 p_fim: date_end.strftime("%Y-%m-%d"),
-                # alguns ambientes permitem "apenasConfirmados=true"
-                # se não existir, o Bling ignora silenciosamente
                 "apenasConfirmados": "true",
             }
             rows = _get_paginated_generic(url, headers, params)
@@ -291,45 +291,26 @@ def fetch_bank_confirmed(refresh_token: str, date_start: dt.date, date_end: dt.d
             rows = []
 
     if rows == [] and last_err:
-        # nenhum endpoint funcionou
         raise RuntimeError(f"Extratos (‘Caixas & Bancos’) não disponíveis: {last_err}")
 
-    # Normalização: tentamos mapear as colunas mais comuns
     def g(d, k, default=None): return d.get(k, default) if isinstance(d, dict) else default
-
     def pick_date(d):
-        # datas mais comuns em extratos/lançamentos bancários
-        return (
-            g(d, "data") or
-            g(d, "dataMovimento") or
-            g(d, "dataLancamento") or
-            g(d, "dataBaixa") or
-            g(d, "dataCredito") or
-            g(d, "dataDebito")
-        )
-
+        return (g(d, "data") or g(d, "dataMovimento") or g(d, "dataLancamento")
+                or g(d, "dataBaixa") or g(d, "dataCredito") or g(d, "dataDebito"))
     def pick_amount(d):
-        """
-        Constrói o valor (positivo entradas, negativo saídas).
-        Estratégias:
-         - se houver campos separados de crédito/débito, faz crédito - débito
-         - se houver 'tipo' ('C'/'D'), usa sinal conforme tipo
-         - senão, tenta 'valor' já com sinal
-        """
         credito = g(d, "valorCredito") or g(d, "credito") or 0
         debito  = g(d, "valorDebito")  or g(d, "debito")  or 0
         if credito or debito:
-            return float(pd.to_numeric(credito, errors="coerce") or 0) - float(pd.to_numeric(debito, errors="coerce") or 0)
-
+            c = float(pd.to_numeric(credito, errors="coerce") or 0)
+            d = float(pd.to_numeric(debito,  errors="coerce") or 0)
+            return c - d
         valor = g(d, "valorLancamento") or g(d, "valorAbsoluto") or g(d, "valor")
         if valor is not None:
             v = float(pd.to_numeric(valor, errors="coerce") or 0)
-            tipo = (g(d, "tipo") or g(d, "natureza") or "").upper()  # 'C'/'D' ou 'ENTRADA'/'SAIDA'
-            if tipo.startswith("D") or "SAID" in tipo:
-                return -abs(v)
-            if tipo.startswith("C") or "ENTR" in tipo:
-                return abs(v)
-            return v  # já veio com sinal
+            tipo = (g(d, "tipo") or g(d, "natureza") or "").upper()
+            if tipo.startswith("D") or "SAID" in tipo: return -abs(v)
+            if tipo.startswith("C") or "ENTR" in tipo: return  abs(v)
+            return v
         return 0.0
 
     df = pd.DataFrame([{
@@ -341,7 +322,6 @@ def fetch_bank_confirmed(refresh_token: str, date_start: dt.date, date_end: dt.d
     if not df.empty:
         df["data"] = pd.to_datetime(df["data"], errors="coerce")
         df = df.dropna(subset=["data"])
-
     return df, maybe_new_refresh
 
 # ====== 2) RECEBER/PAGAR pagos (fallback) ======
@@ -374,7 +354,6 @@ def _get_paginated_rp(fin_url: str, headers: dict, date_start: dt.date, date_end
 def fetch_cashflow_fallback(refresh_token: str, date_start: dt.date, date_end: dt.date) -> Tuple[pd.DataFrame, Optional[str]]:
     access, maybe_new_refresh = refresh_access_token(refresh_token)
     headers = {"Authorization": f"Bearer {access}"}
-
     tries = [
         ("dataPagamentoInicial", "dataPagamentoFinal"),
         ("dataBaixaInicial", "dataBaixaFinal"),
@@ -430,7 +409,7 @@ def fetch_cashflow_fallback(refresh_token: str, date_start: dt.date, date_end: d
     df = df.dropna(subset=["data"])
     return df, maybe_new_refresh
 
-# ============== DASHBOARD TAB ==============
+# ================== DASHBOARD ==================
 with tab_dash:
     st.title("📊 Dashboard de vendas – Bling (Tiburcio’s Stuff)")
 
@@ -439,7 +418,7 @@ with tab_dash:
             st.info("Autorize a conta **TS** na aba **‘🔐 Integração (OAuth)’** para carregar as vendas/financeiro.")
         st.stop()
 
-    # Carrega VENDAS
+    # --- VENDAS
     errors: List[str] = []
     try:
         df_vendas, new_r = fetch_orders(st.session_state["ts_refresh"], date_start, date_end)
@@ -449,14 +428,15 @@ with tab_dash:
         errors.append(f"Vendas: {e}")
         df_vendas = pd.DataFrame()
 
-    # Carrega FINANCEIRO (preferência: extratos confirmados; fallback: receber/pagar pagos)
+    # --- FINANCEIRO: preferir extratos confirmados; fallback receber/pagar pagos
+    origem_fin = "Indisponível"
+    df_mov = pd.DataFrame(columns=["data", "descricao", "valor"])
     try:
         df_mov, new_r2 = fetch_bank_confirmed(st.session_state["ts_refresh"], date_start, date_end)
         origem_fin = "Caixas & Bancos (confirmados)"
         if new_r2:
             st.session_state["ts_refresh"] = new_r2
     except Exception as e:
-        # Fallback
         try:
             df_mov, new_r3 = fetch_cashflow_fallback(st.session_state["ts_refresh"], date_start, date_end)
             origem_fin = "Receber/Pagar pagos (fallback)"
@@ -464,14 +444,14 @@ with tab_dash:
                 st.session_state["ts_refresh"] = new_r3
         except Exception as e2:
             errors.append(f"Financeiro: {e}\nFallback: {e2}")
-            df_mov = pd.DataFrame(columns=["data","descricao","valor"])
+            # mantém df_mov vazio e origem_fin = "Indisponível"
 
     if errors:
         with st.expander("Avisos/Erros de integração", expanded=True):
             for e in errors:
                 st.warning(e)
 
-    # ===== Sub-abas reordenadas: Vendas primeiro, depois Financeiro =====
+    # ===== Sub-abas: Vendas primeiro, Financeiro depois
     sub_sales, sub_fin = st.tabs(["🛒 Vendas", "📈 Financeiro (DRE mensal)"])
 
     # ---------- Vendas ----------
@@ -501,16 +481,15 @@ with tab_dash:
         if df_mov.empty:
             st.info("Nenhum lançamento financeiro no período.")
         else:
-            # agrega por mês
             tmp = df_mov.copy()
             tmp["mes"] = pd.to_datetime(tmp["data"]).dt.to_period("M").dt.to_timestamp()
+
             receitas = tmp[tmp["valor"] > 0].groupby("mes", as_index=False)["valor"].sum().rename(columns={"valor":"receitas"})
             despesas = tmp[tmp["valor"] < 0].groupby("mes", as_index=False)["valor"].sum().rename(columns={"valor":"despesas"})
             dre = pd.merge(receitas, despesas, on="mes", how="outer").fillna(0.0)
             dre["resultado"] = dre["receitas"] + dre["despesas"]   # despesas negativas
             dre["acumulado"] = dre["resultado"].cumsum()
 
-            # KPIs do período
             total_in  = float(dre["receitas"].sum()) if not dre.empty else 0.0
             total_out = float(dre["despesas"].sum()) if not dre.empty else 0.0
             saldo     = total_in + total_out
@@ -519,7 +498,6 @@ with tab_dash:
             colB.metric("Despesas (confirmadas)", f"R$ {abs(total_out):,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
             colC.metric("Resultado do período",   f"R$ {saldo:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
 
-            # Gráfico Receitas/Despesas + Resultado
             base = alt.Chart(dre).encode(x=alt.X("mes:T", title="Mês"))
             bars = alt.layer(
                 base.mark_bar().encode(y=alt.Y("receitas:Q", title="Valor"), color=alt.value("#4CAF50")),
@@ -534,5 +512,5 @@ with tab_dash:
                 show[c] = show[c].map(lambda v: f"R$ {v:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
             st.dataframe(show, use_container_width=True)
 
-            with st.expander("Detalhe – Movimentos (Caixas & Bancos)"):
+            with st.expander("Detalhe – Movimentos (financeiro)"):
                 st.dataframe(df_mov.sort_values("data", ascending=False), use_container_width=True)
