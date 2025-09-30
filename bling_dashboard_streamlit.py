@@ -178,10 +178,7 @@ with tab_oauth:
                     except Exception as e:
                         st.error(f"Falha na troca manual do code: {e}")
 
-    st.divider()
-    st.subheader("Refresh token atual")
-    st.caption("Copie e cole este valor no secrets como `TS_REFRESH_TOKEN`.")
-    st.code(st.session_state.get("ts_refresh") or "—", language="text")
+    # (Removido) Exibição do refresh token nesta aba
 
 # ---------------- Sidebar filtros ----------------
 st.sidebar.header("Filtros")
@@ -624,31 +621,13 @@ with tab_dash:
             colB.metric("Pago no período",   f"R$ {total_pay:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
             colC.metric("Diferença",         f"R$ {diff:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
 
-            colIn, colOut = st.columns(2)
-            with colIn:
-                st.caption("Recebido por mês (Entradas)")
-                chart_in = (
-                    alt.Chart(dre)
-                    .mark_bar(color="#4CAF50")
-                    .encode(
-                        x=alt.X("mes:T", title="Mês"),
-                        y=alt.Y("entradas:Q", title="Valor"),
-                        tooltip=["mes:T", alt.Tooltip("entradas:Q", title="Entradas", format=",")],
-                    )
-                )
-                st.altair_chart(chart_in, use_container_width=True)
-            with colOut:
-                st.caption("Pago por mês (Saídas)")
-                chart_out = (
-                    alt.Chart(dre)
-                    .mark_bar(color="#E53935")
-                    .encode(
-                        x=alt.X("mes:T", title="Mês"),
-                        y=alt.Y("pagos:Q", title="Valor"),
-                        tooltip=["mes:T", alt.Tooltip("pagos:Q", title="Pagos", format=",")],
-                    )
-                )
-                st.altair_chart(chart_out, use_container_width=True)
+            base = alt.Chart(dre).encode(x=alt.X("mes:T", title="Mês"))
+            bars = alt.layer(
+                base.mark_bar().encode(y=alt.Y("entradas:Q", title="Valor"), color=alt.value("#4CAF50")),
+                base.mark_bar().encode(y="pagos:Q", color=alt.value("#E53935"))
+            )
+            line = base.mark_line(point=True).encode(y="diferenca:Q", color=alt.value("#1E88E5"))
+            st.altair_chart(bars + line, use_container_width=True)
 
             st.subheader("Tabela DRE mensal")
             show = dre[["mes", "entradas", "pagos", "diferenca", "acumulado"]].copy()
