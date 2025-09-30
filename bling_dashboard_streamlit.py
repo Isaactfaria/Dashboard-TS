@@ -484,31 +484,46 @@ with tab_dash:
             tmp = df_mov.copy()
             tmp["mes"] = pd.to_datetime(tmp["data"]).dt.to_period("M").dt.to_timestamp()
 
-            receitas = tmp[tmp["valor"] > 0].groupby("mes", as_index=False)["valor"].sum().rename(columns={"valor":"receitas"})
-            despesas = tmp[tmp["valor"] < 0].groupby("mes", as_index=False)["valor"].sum().rename(columns={"valor":"despesas"})
+            # Entradas (valores positivos) e Pagos (valores negativos, convertidos para positivo)
+            receitas = (
+                tmp[tmp["valor"] > 0]
+                .groupby("mes", as_index=False)["valor"]
+                .sum()
+                .rename(columns={"valor": "entradas"})
+            )
+            despesas = (
+                tmp[tmp["valor"] < 0]
+                .groupby("mes", as_index=False)["valor"]
+                .sum()
+                .rename(columns={"valor": "despesas"})
+            )
             dre = pd.merge(receitas, despesas, on="mes", how="outer").fillna(0.0)
-            dre["resultado"] = dre["receitas"] + dre["despesas"]   # despesas negativas
-            dre["acumulado"] = dre["resultado"].cumsum()
+            # Converter despesas negativas para 'pagos' positivos
+            dre["pagos"] = (-dre["despesas"]).clip(lower=0)
+            dre["entradas"] = dre.get("entradas", 0.0)
+            # Diferença = Entradas - Pagos
+            dre["diferenca"] = dre["entradas"] - dre["pagos"]
+            dre["acumulado"] = dre["diferenca"].cumsum()
 
-            total_in  = float(dre["receitas"].sum()) if not dre.empty else 0.0
-            total_out = float(dre["despesas"].sum()) if not dre.empty else 0.0
-            saldo     = total_in + total_out
+            total_in  = float(dre["entradas"].sum()) if not dre.empty else 0.0
+            total_pay = float(dre["pagos"].sum()) if not dre.empty else 0.0
+            diff      = total_in - total_pay
             colA, colB, colC = st.columns(3)
-            colA.metric("Receitas (confirmadas)", f"R$ {total_in:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
-            colB.metric("Despesas (confirmadas)", f"R$ {abs(total_out):,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
-            colC.metric("Resultado do período",   f"R$ {saldo:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
+            colA.metric("Entrou no período", f"R$ {total_in:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
+            colB.metric("Pago no período",   f"R$ {total_pay:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
+            colC.metric("Diferença",         f"R$ {diff:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
 
             base = alt.Chart(dre).encode(x=alt.X("mes:T", title="Mês"))
             bars = alt.layer(
-                base.mark_bar().encode(y=alt.Y("receitas:Q", title="Valor"), color=alt.value("#4CAF50")),
-                base.mark_bar().encode(y="despesas:Q", color=alt.value("#E53935"))
+                base.mark_bar().encode(y=alt.Y("entradas:Q", title="Valor"), color=alt.value("#4CAF50")),
+                base.mark_bar().encode(y="pagos:Q", color=alt.value("#E53935"))
             )
-            line = base.mark_line(point=True).encode(y="resultado:Q", color=alt.value("#1E88E5"))
+            line = base.mark_line(point=True).encode(y="diferenca:Q", color=alt.value("#1E88E5"))
             st.altair_chart(bars + line, use_container_width=True)
 
             st.subheader("Tabela DRE mensal")
-            show = dre.copy()
-            for c in ["receitas","despesas","resultado","acumulado"]:
+            show = dre[["mes", "entradas", "pagos", "diferenca", "acumulado"]].copy()
+            for c in ["entradas", "pagos", "diferenca", "acumulado"]:
                 show[c] = show[c].map(lambda v: f"R$ {v:,.2f}".replace(",", "#").replace(".", ",").replace("#", "."))
             st.dataframe(show, use_container_width=True)
 
