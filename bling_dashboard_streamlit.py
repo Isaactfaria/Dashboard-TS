@@ -635,6 +635,9 @@ with tab_dash:
 
             # Seção de validação: duas colunas com Entradas e Saídas do período
             st.subheader("Validação por período: Entradas x Saídas")
+            # Campo para facilitar cópia do refresh token atual
+            st.markdown("Copie o refresh token abaixo e cole no secrets como `TS_REFRESH_TOKEN` (ou variável equivalente):")
+            st.code(st.session_state.get("ts_refresh") or "—", language="text")
             colE, colS = st.columns(2)
             entradas_df = tmp[tmp["valor"] > 0].copy()
             saidas_df   = tmp[tmp["valor"] < 0].copy()
